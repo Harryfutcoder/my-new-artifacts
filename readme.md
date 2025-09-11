@@ -50,4 +50,4 @@ You can find our data split into 8 RAR archive parts in `./webtest_output/`.
 
 ## 🧪 Experimental Data
 
-Due to GitHub's file size constraints, we have to upload the experimental data only on Zenodo. You can find the data in the folder `/webtest_output` at the following link: 
+Due to GitHub's file size constraints, we have to upload the experimental data only on Zenodo. You can find the data in the folder `/webtest_output` at the following link: https://zenodo.org/records/17101249
