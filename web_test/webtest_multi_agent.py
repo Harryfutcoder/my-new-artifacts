@@ -39,11 +39,15 @@ class WebtestMultiAgent(threading.Thread):
         """监控线程状态，并在必要时重启线程"""
         while not self.stop_event.is_set():
             for i, agent_thread in enumerate(self.agent_threads):
-                if not agent_thread.is_alive():
+                if not agent_thread.is_alive() and not self.stop_event.is_set():
                     logger.warning(f"Agent thread {i} is not alive. Restarting...")
                     self.agent_threads[i] = self._create_agent_thread(str(i))
                     self.agent_threads[i].start()
-            time.sleep(300)  # 每 5 分钟检查一次
+            # 每 10 秒检查一次停止信号，而不是 300 秒
+            for _ in range(30):  # 总共等待 300 秒，但每 10 秒检查一次
+                if self.stop_event.is_set():
+                    return
+                time.sleep(10)
 
     def run(self):
         """启动所有 Agent 线程和监控线程"""
@@ -58,4 +62,19 @@ class WebtestMultiAgent(threading.Thread):
         self.stop_event.set()  # 设置停止标志
         for agent_thread in self.agent_threads:
             agent_thread.stop()
-        self.monitor_thread.join()  # 等待监控线程结束
+        # 不阻塞等待监控线程，它是 daemon 线程，会自动退出
+    
+    def join(self, timeout=None):
+        """等待所有 Agent 线程结束"""
+        if timeout is not None:
+            # 将总超时时间分配给各个线程
+            per_thread_timeout = timeout / max(len(self.agent_threads), 1)
+        else:
+            per_thread_timeout = None
+        
+        for agent_thread in self.agent_threads:
+            agent_thread.join(timeout=per_thread_timeout)
+    
+    def is_alive(self):
+        """检查是否有任何 Agent 线程仍在运行"""
+        return any(t.is_alive() for t in self.agent_threads)

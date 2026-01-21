@@ -150,16 +150,37 @@ class MultiAgentThread(threading.Thread):
                     logger.warning(f"Thread {self.agent_name}: Execute action failed ({type(e).__name__}), New state: {new_state}")
             except (Exception, KeyboardInterrupt) as e:
                 logger.exception(f"Thread {self.agent_name}: Error happened")
-                self.restart_webdriver()
-                continuous_restart_count = 0
-                self.driver.get(settings.entry_url)
-                self.stop_event.wait(2)
-                html = self.init_state()
-                self.multi_agent_system.deal_exception(self.agent_name)
-            if len(self.driver.window_handles) > 1:
-                self.driver.switch_to.window(self.driver.window_handles[1])
-                self.close_other_windows()
-        self.driver.quit()
+                try:
+                    self.restart_webdriver()
+                    continuous_restart_count = 0
+                    self.driver.get(settings.entry_url)
+                    self.stop_event.wait(2)
+                    html = self.init_state()
+                    self.multi_agent_system.deal_exception(self.agent_name)
+                except Exception as restart_error:
+                    logger.exception(f"Thread {self.agent_name}: Failed to restart webdriver: {restart_error}")
+                    # 如果重启失败，等待一段时间后再尝试
+                    self.stop_event.wait(5)
+                    try:
+                        self.restart_webdriver()
+                        self.driver.get(settings.entry_url)
+                        self.stop_event.wait(2)
+                        html = self.init_state()
+                    except Exception as final_error:
+                        logger.exception(f"Thread {self.agent_name}: Final restart attempt failed, exiting: {final_error}")
+                        break  # 退出循环，线程安全结束
+            # 窗口处理也需要保护
+            try:
+                if len(self.driver.window_handles) > 1:
+                    self.driver.switch_to.window(self.driver.window_handles[1])
+                    self.close_other_windows()
+            except Exception as window_error:
+                logger.warning(f"Thread {self.agent_name}: Failed to handle windows: {window_error}")
+        # 安全退出
+        try:
+            self.driver.quit()
+        except Exception as quit_error:
+            logger.warning(f"Thread {self.agent_name}: Failed to quit driver: {quit_error}")
 
     def init_state(self):
         action_list = self.action_detector.get_actions(self.driver)

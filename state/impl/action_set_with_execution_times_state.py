@@ -135,7 +135,7 @@ class ActionSetWithExecutionTimesState(WebState):
                                   weights['submit'] * submit_similarity +
                                   weights['default'] * default_similarity)
             self.sim_dic[other] = overall_similarity
-            other.sim_dic[other] = overall_similarity
+            other.sim_dic[self] = overall_similarity  # 修复：应该用 self 作为键
         return self.sim_dic[other]
 
     def __eq__(self, other: object) -> bool:

@@ -92,6 +92,29 @@ class PerformanceMetrics:
     step_times_over_time: List[float] = field(default_factory=list)
     timestamps: List[float] = field(default_factory=list)
     
+    # === 新增：实际网页测试指标 ===
+    # URL 路径覆盖
+    unique_url_paths: int = 0           # 唯一 URL 路径数 (不含参数)
+    url_depth_max: int = 0              # 最大 URL 深度
+    url_depth_avg: float = 0.0          # 平均 URL 深度
+    
+    # 动作类型分布
+    click_actions: int = 0              # 点击动作数
+    input_actions: int = 0              # 输入动作数
+    select_actions: int = 0             # 选择动作数
+    
+    # 错误和异常发现
+    js_errors_found: int = 0            # JavaScript 错误数
+    page_errors_found: int = 0          # 页面错误数 (404, 500等)
+    action_failures: int = 0            # 动作执行失败数
+    out_of_domain_count: int = 0        # 跳出域名次数
+    same_url_stuck_count: int = 0       # URL 卡住次数
+    
+    # 探索效率
+    new_state_rate: float = 0.0         # 新状态发现率 (新状态数/总步数)
+    exploration_efficiency: float = 0.0 # 探索效率 (唯一URL/总步数)
+    action_diversity: float = 0.0       # 动作多样性 (唯一动作/总动作)
+    
     def to_dict(self) -> Dict:
         return asdict(self)
     
@@ -109,6 +132,7 @@ class PerformanceMetrics:
 ║   - 发现状态数: {self.unique_states} (总访问: {self.total_states_discovered})
 ║   - 发现动作数: {self.unique_actions} (总执行: {self.total_actions_discovered})
 ║   - 访问 URL 数: {self.unique_urls} (总访问: {self.total_urls_visited})
+║   - URL 路径数: {self.unique_url_paths} (最大深度: {self.url_depth_max})
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【时间性能】
 ║   - 总步数: {self.total_steps}
@@ -124,8 +148,17 @@ class PerformanceMetrics:
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【探索效率】
 ║   - 平均状态新颖度: {self.avg_state_novelty:.4f}
+║   - 新状态发现率: {self.new_state_rate:.4f}
+║   - 探索效率: {self.exploration_efficiency:.4f}
+║   - 动作多样性: {self.action_diversity:.4f}
 ║   - 状态发现速率: {self.unique_states / max(self.duration_seconds, 1) * 60:.2f} 个/分钟
-║   - URL 发现速率: {self.unique_urls / max(self.duration_seconds, 1) * 60:.2f} 个/分钟
+╠══════════════════════════════════════════════════════════════════╣
+║ 【动作类型分布】
+║   - 点击: {self.click_actions}  输入: {self.input_actions}  选择: {self.select_actions}
+╠══════════════════════════════════════════════════════════════════╣
+║ 【错误与异常】
+║   - 动作失败: {self.action_failures}  跳出域名: {self.out_of_domain_count}
+║   - URL 卡住: {self.same_url_stuck_count}
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【资源使用】
 ║   - 峰值内存: {self.peak_memory_mb:.1f} MB
@@ -160,6 +193,12 @@ class PerformanceMonitor:
         self.record_interval = 10  # 每10秒记录一次时间序列数据
         self._last_record_time = 0
         
+        # 新增：收集实际测试指标
+        self.url_paths_set = set()        # URL 路径集合 (不含参数)
+        self.url_depths: List[int] = []   # URL 深度列表
+        self.action_types: Dict[str, int] = {'click': 0, 'input': 0, 'select': 0, 'other': 0}
+        self.error_counts: Dict[str, int] = {'js': 0, 'page': 0, 'action_fail': 0, 'out_of_domain': 0, 'same_url': 0}
+        
     def start(self):
         """开始监控"""
         self.start_time = time.time()
@@ -190,8 +229,11 @@ class PerformanceMonitor:
             time.sleep(1)
     
     def record_step(self, step_time: float, reward: float, state_hash: int, 
-                    action_hash: int, url: str, novelty: float = 0.0):
+                    action_hash: int, url: str, novelty: float = 0.0,
+                    action_type: str = 'other'):
         """记录单步执行数据"""
+        from urllib.parse import urlparse
+        
         with self.lock:
             self.step_times.append(step_time * 1000)  # 转换为毫秒
             self.rewards.append(reward)
@@ -199,7 +241,22 @@ class PerformanceMonitor:
             self.actions_set.add(action_hash)
             if url:
                 self.urls_set.add(url)
+                # 解析 URL 路径和深度
+                try:
+                    parsed = urlparse(url)
+                    path = parsed.path.rstrip('/')
+                    self.url_paths_set.add(f"{parsed.netloc}{path}")
+                    depth = len([p for p in path.split('/') if p])
+                    self.url_depths.append(depth)
+                except:
+                    pass
             self.novelty_scores.append(novelty)
+            
+            # 记录动作类型
+            if action_type in self.action_types:
+                self.action_types[action_type] += 1
+            else:
+                self.action_types['other'] += 1
             
             self.metrics.total_states_discovered += 1
             self.metrics.total_actions_discovered += 1
@@ -218,6 +275,12 @@ class PerformanceMonitor:
                         sum(self.step_times[-100:]) / min(len(self.step_times), 100)
                     )
                 self._last_record_time = current_time
+    
+    def record_error(self, error_type: str):
+        """记录错误/异常事件"""
+        with self.lock:
+            if error_type in self.error_counts:
+                self.error_counts[error_type] += 1
     
     def record_learning_update(self, loss: float):
         """记录学习更新"""
@@ -264,6 +327,31 @@ class PerformanceMonitor:
                 self.metrics.avg_memory_mb = sum(self.memory_samples) / len(self.memory_samples)
             if self.cpu_samples:
                 self.metrics.cpu_usage_percent = sum(self.cpu_samples) / len(self.cpu_samples)
+            
+            # === 新增：实际测试指标 ===
+            # URL 路径覆盖
+            self.metrics.unique_url_paths = len(self.url_paths_set)
+            if self.url_depths:
+                self.metrics.url_depth_max = max(self.url_depths)
+                self.metrics.url_depth_avg = sum(self.url_depths) / len(self.url_depths)
+            
+            # 动作类型分布
+            self.metrics.click_actions = self.action_types.get('click', 0)
+            self.metrics.input_actions = self.action_types.get('input', 0)
+            self.metrics.select_actions = self.action_types.get('select', 0)
+            
+            # 错误和异常
+            self.metrics.js_errors_found = self.error_counts.get('js', 0)
+            self.metrics.page_errors_found = self.error_counts.get('page', 0)
+            self.metrics.action_failures = self.error_counts.get('action_fail', 0)
+            self.metrics.out_of_domain_count = self.error_counts.get('out_of_domain', 0)
+            self.metrics.same_url_stuck_count = self.error_counts.get('same_url', 0)
+            
+            # 探索效率计算
+            if self.metrics.total_steps > 0:
+                self.metrics.new_state_rate = self.metrics.unique_states / self.metrics.total_steps
+                self.metrics.exploration_efficiency = self.metrics.unique_urls / self.metrics.total_steps
+                self.metrics.action_diversity = self.metrics.unique_actions / self.metrics.total_steps
 
 
 class BenchmarkRunner:
@@ -464,11 +552,25 @@ class BenchmarkRunner:
             # 创建测试实例
             webtest = WebtestMultiAgent(chrome_options)
             
+            # 导入状态类型用于错误监控
+            from state.impl.out_of_domain_state import OutOfDomainState
+            from state.impl.same_url_state import SameUrlState
+            from state.impl.action_execute_failed_state import ActionExecuteFailedState
+            
             # 注入监控钩子
             original_get_action = webtest.multi_agent_system.get_action
             
             def monitored_get_action(web_state, html, agent_name, url, check_result):
                 step_start = time.time()
+                
+                # 记录状态类型（用于统计错误）
+                if isinstance(web_state, OutOfDomainState):
+                    monitor.record_error('out_of_domain')
+                elif isinstance(web_state, SameUrlState):
+                    monitor.record_error('same_url')
+                elif isinstance(web_state, ActionExecuteFailedState):
+                    monitor.record_error('action_fail')
+                
                 try:
                     action = original_get_action(web_state, html, agent_name, url, check_result)
                     step_time = time.time() - step_start
@@ -528,13 +630,24 @@ class BenchmarkRunner:
                         # 如果有任何错误，记录但不中断
                         pass
                     
+                    # 识别动作类型
+                    action_type = 'other'
+                    action_class = action.__class__.__name__ if action else 'None'
+                    if 'Click' in action_class:
+                        action_type = 'click'
+                    elif 'Input' in action_class:
+                        action_type = 'input'
+                    elif 'Select' in action_class:
+                        action_type = 'select'
+                    
                     monitor.record_step(
                         step_time=step_time,
                         reward=reward,
                         state_hash=hash(str(web_state)),
                         action_hash=hash(str(action)),
                         url=url,
-                        novelty=novelty
+                        novelty=novelty,
+                        action_type=action_type
                     )
                     
                     return action
@@ -632,15 +745,30 @@ class BenchmarkRunner:
         
         # 按指标对比
         metrics_to_compare = [
+            # 基础覆盖指标
             ("状态覆盖", "unique_states", "个", True),
             ("动作覆盖", "unique_actions", "个", True),
             ("URL 覆盖", "unique_urls", "个", True),
+            ("URL路径覆盖", "unique_url_paths", "个", True),
+            # 时间性能
             ("总步数", "total_steps", "步", True),
             ("平均步时间", "avg_step_time_ms", "ms", False),
             ("每秒步数", "steps_per_second", "步/秒", True),
+            # 奖励指标
             ("累计奖励", "total_reward", "", True),
             ("平均奖励", "avg_reward_per_step", "", True),
             ("状态新颖度", "avg_state_novelty", "", True),
+            # 探索效率（新增）
+            ("新状态率", "new_state_rate", "", True),
+            ("探索效率", "exploration_efficiency", "", True),
+            ("动作多样性", "action_diversity", "", True),
+            # 动作类型分布（新增）
+            ("点击动作", "click_actions", "次", True),
+            ("输入动作", "input_actions", "次", True),
+            # 错误发现（新增）
+            ("动作失败", "action_failures", "次", False),
+            ("跳出域名", "out_of_domain_count", "次", False),
+            # 学习和资源
             ("学习更新", "learning_updates", "次", True),
             ("平均损失", "avg_loss", "", False),
             ("峰值内存", "peak_memory_mb", "MB", False),

@@ -7,8 +7,7 @@ default_continuous_restart_threshold: 5
 default_enable_screen_shot: True
 
 profiles:
-  # SHAQ (SHapley Q-value) 算法配置
-  # 使用 Lovasz 扩展高效计算 Shapley value，避免 Monte Carlo 采样的指数级计算复杂度
+  
   github-marl-3h-shaq-5agent:
     agent_num: 5
     alive_time: 10800

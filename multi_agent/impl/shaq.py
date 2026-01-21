@@ -326,7 +326,8 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
         self.shapley_method = params.get("shapley_method", "fast")  # fast/multipoint/gradient
         self.shapley_update_interval = params.get("shapley_update_interval", 5)  # 每N步计算一次Shapley
         self.use_shapley_exploration = params.get("use_shapley_exploration", True)  # 使用Shapley引导探索
-        self.shapley_exploration_bonus = params.get("shapley_exploration_bonus", 0.5)  # Shapley探索奖励系数
+        self.shapley_exploration_bonus = params.get("shapley_exploration_bonus", 1.5)  # 增强Shapley探索奖励系数 (原0.5)
+        self.exploration_decay_rate = params.get("exploration_decay_rate", 0.995)  # 探索衰减率
         self.async_joint_learning = params.get("async_joint_learning", True)  # 异步联合学习
         self.alive_time = params.get("alive_time", 10800)
 
@@ -417,13 +418,17 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
         # 损失函数
         self.criterion = nn.MSELoss()
 
-        # 奖励常量
+        # 奖励常量 - 优化版本：增强探索激励
         self.R_PENALTY = -99.0
         self.R_A_PENALTY = -5.0
-        self.R_A_BASE_HIGH = 50.0
-        self.R_A_BASE_MIDDLE = 10.0
-        self.R_A_MIN_SIM_LINE = 0.7
-        self.R_A_MIDDLE_SIM_LINE = 0.85
+        self.R_A_BASE_HIGH = 80.0      # 提高新状态奖励 (原 50.0)
+        self.R_A_BASE_MIDDLE = 30.0    # 提高中等新颖奖励 (原 10.0)
+        self.R_A_MIN_SIM_LINE = 0.6    # 降低阈值，更容易获得高奖励 (原 0.7)
+        self.R_A_MIDDLE_SIM_LINE = 0.8 # 调整中间阈值 (原 0.85)
+        
+        # 新增：重复状态惩罚系数
+        self.R_REPEAT_PENALTY = 0.3    # 重复访问的惩罚因子
+        self.R_URL_DIVERSITY_BONUS = 20.0  # 新 URL 奖励
         
         # Shapley 相关的缓存和状态
         self.cached_shapley_values: Dict[str, float] = {str(i): 1.0 / self.agent_num for i in range(self.agent_num)}
@@ -434,6 +439,10 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
         # 探索奖励追踪
         self.agent_exploration_scores: Dict[str, float] = {str(i): 0.0 for i in range(self.agent_num)}
         self.new_states_by_agent: Dict[str, int] = {str(i): 0 for i in range(self.agent_num)}
+        
+        # 新增：URL 多样性追踪
+        self.visited_urls: set = set()
+        self.visited_url_paths: set = set()  # 只记录路径部分
         
         logger.info(f"SHAQ initialized with {self.agent_num} agents, "
                    f"Shapley method: {self.shapley_method}, "
@@ -495,27 +504,47 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
             self.max_random - self.min_random
         )
 
-        # Shapley 引导的探索调整：
-        # 高 Shapley value 的智能体应该更多地利用（exploit），
-        # 低 Shapley value 的智能体应该更多地探索（explore）
+        # Shapley 引导的探索调整 - 优化版：
+        # 1. 低 Shapley value 的智能体应更激进探索
+        # 2. 前期所有智能体都应更多探索
+        # 3. 添加探索分数奖励
         if self.use_shapley_exploration:
             shapley_val = self.cached_shapley_values.get(agent_name, 1.0 / self.agent_num)
             avg_shapley = 1.0 / self.agent_num
             
-            # 如果该智能体的 Shapley value 低于平均，增加探索
-            # 如果高于平均，减少探索（更多利用其优势）
-            shapley_factor = 1.0 + self.shapley_exploration_bonus * (avg_shapley - shapley_val) / avg_shapley
-            epsilon = min(self.max_random, base_epsilon * shapley_factor)
+            # 计算相对 Shapley 贡献
+            relative_shapley = (shapley_val - avg_shapley) / (avg_shapley + 1e-6)
+            
+            # 如果该智能体的 Shapley value 低于平均，大幅增加探索
+            # 使用更激进的调整因子
+            if relative_shapley < 0:
+                # 低贡献者：大幅增加探索
+                shapley_factor = 1.0 + self.shapley_exploration_bonus * abs(relative_shapley) * 2.0
+            else:
+                # 高贡献者：适度减少探索，但保持最低探索率
+                shapley_factor = max(0.5, 1.0 - self.shapley_exploration_bonus * relative_shapley * 0.5)
+            
+            # 结合探索分数：探索得分高的 agent 应继续探索
+            exploration_score = self.agent_exploration_scores.get(agent_name, 0)
+            if exploration_score > 0.3:  # 高探索得分
+                shapley_factor *= 1.2
+            
+            epsilon = min(self.max_random, max(self.min_random, base_epsilon * shapley_factor))
         else:
             epsilon = base_epsilon
         
         if random.uniform(0, 1) < epsilon:
-            # 探索：优先选择未执行过的动作
+            # 探索：优先选择未执行过或执行次数少的动作
             unexplored = [a for a in actions if self.action_dict.get(a, 0) == 0]
+            rarely_used = [a for a in actions if 0 < self.action_dict.get(a, 0) <= 2]
+            
             if unexplored:
                 chosen_action = random.choice(unexplored)
                 # 记录探索新动作
                 self.new_states_by_agent[agent_name] = self.new_states_by_agent.get(agent_name, 0) + 1
+            elif rarely_used:
+                # 次优选择：较少使用的动作
+                chosen_action = random.choice(rarely_used)
             else:
                 chosen_action = random.choice(actions)
         
@@ -564,7 +593,15 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
         self.try_joint_learning(web_state, html, agent_name)
     
     def get_reward(self, web_state: WebState, agent_name: str) -> float:
-        """计算奖励。"""
+        """
+        计算奖励 - 优化版本：强化探索激励。
+        
+        优化点：
+        1. 增加新状态奖励
+        2. 对重复状态增加惩罚
+        3. 新增 URL 多样性奖励
+        4. 动态探索衰减
+        """
         if self.reward_function != "A":
             return 0.0
         
@@ -573,7 +610,7 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
         
         # 计算与已知状态的最大相似度
         max_sim = -1.0
-        for temp_state in self.state_list:
+        for temp_state in self.state_list[-200:]:  # 只看最近200个状态，提高效率
             if isinstance(temp_state, (OutOfDomainState, ActionExecuteFailedState, SameUrlState)):
                 continue
             if web_state == temp_state:
@@ -582,14 +619,40 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
             if sim > max_sim:
                 max_sim = sim
         
-        # 基于新颖度的奖励
+        # 基于新颖度的奖励 - 优化版
         if max_sim < self.R_A_MIN_SIM_LINE:
+            # 非常新颖的状态：高奖励
             r_state = self.R_A_BASE_HIGH
         elif max_sim < self.R_A_MIDDLE_SIM_LINE:
+            # 中等新颖：中等奖励
             r_state = self.R_A_BASE_MIDDLE
         else:
+            # 重复状态：使用指数衰减惩罚
             visited_time = self.state_dict.get(web_state, 0)
-            r_state = 2.0 if visited_time == 0 else 1.0 / visited_time
+            if visited_time == 0:
+                r_state = 5.0
+            else:
+                # 指数衰减：访问越多，奖励越低
+                r_state = 5.0 * (self.R_REPEAT_PENALTY ** visited_time)
+                # 最低不低于 0.1
+                r_state = max(0.1, r_state)
+        
+        # URL 多样性奖励 - 新增
+        r_url = 0.0
+        current_url = getattr(web_state, 'url', None)
+        if current_url:
+            # 提取 URL 路径
+            from urllib.parse import urlparse
+            parsed = urlparse(current_url)
+            url_path = parsed.path
+            
+            if url_path and url_path not in self.visited_url_paths:
+                # 发现新的 URL 路径，给予奖励
+                r_url = self.R_URL_DIVERSITY_BONUS
+                self.visited_url_paths.add(url_path)
+            
+            if current_url not in self.visited_urls:
+                self.visited_urls.add(current_url)
         
         # 动作执行频率奖励
         prev_state = self.prev_state_dict.get(agent_name)
@@ -599,13 +662,25 @@ class SHAQ(multi_agent.multi_agent_system.MultiAgentSystem):
             r_action = 0.0
         else:
             exec_count = self.action_count.get(prev_action, 0)
-            r_action = 2.0 if exec_count == 0 else 1.0 / float(exec_count)
+            if exec_count == 0:
+                r_action = 5.0  # 增加首次执行奖励
+            else:
+                # 使用指数衰减
+                r_action = 5.0 * (0.5 ** exec_count)
+                r_action = max(0.1, r_action)
         
-        # 时间因子
+        # 时间因子 - 添加探索衰减
         time_diff = (datetime.now() - self.start_time).total_seconds()
-        r_time = 1 + time_diff / self.alive_time
+        progress = time_diff / self.alive_time
         
-        return (r_state + r_action) * r_time
+        # 前期强调探索，后期强调利用
+        # 探索系数：从 1.5 衰减到 1.0
+        exploration_factor = 1.5 - 0.5 * progress
+        exploration_factor = max(1.0, exploration_factor)
+        
+        # 最终奖励
+        base_reward = r_state + r_action + r_url
+        return base_reward * exploration_factor
     
     def try_joint_learning(self, web_state: WebState, html: str, agent_name: str):
         """

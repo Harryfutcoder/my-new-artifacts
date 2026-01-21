@@ -154,10 +154,13 @@ class MultiAgentSystem(ABC):
                 self.state_dict[web_state] = 0
                 return web_state
 
-        # 如果状态已存在，返回匹配的状态
-        for state in self.state_dict.keys():
-            if state == web_state:
-                return state
+            # 如果状态已存在，返回匹配的状态（必须在锁内遍历）
+            for state in self.state_dict.keys():
+                if state == web_state:
+                    return state
+            
+            # 理论上不应该到达这里，但为了安全返回原状态
+            return web_state
 
     def _initialize_agent_state(self, agent_name: str) -> None:
         """
