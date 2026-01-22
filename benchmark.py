@@ -371,6 +371,9 @@ class BenchmarkRunner:
         'nn': 'github-marl-3h-nn-5agent',
         'hybrid': 'github-marl-3h-hybrid-5agent',
         'shaq-qtran': 'github-marl-3h-hybrid-5agent',
+        'shaqv2': 'github-marl-3h-shaqv2-5agent',
+        'shaq-v2': 'github-marl-3h-shaqv2-5agent',
+        'v2': 'github-marl-3h-shaqv2-5agent',
     }
     
     def __init__(self, config_path: str = "settings.yaml"):
@@ -411,7 +414,9 @@ class BenchmarkRunner:
         agent_class = profile_config.get('agent', {}).get('class', '')
         algo_type = profile_config.get('agent', {}).get('params', {}).get('algo_type', '')
         
-        if 'hybrid' in agent_module.lower() or agent_class.lower() == 'shaqqqtranhybrid':
+        if 'shaq_v2' in agent_module.lower() or agent_class.lower() == 'shaqv2':
+            return 'SHAQv2'
+        elif 'hybrid' in agent_module.lower() or agent_class.lower() == 'shaqqqtranhybrid':
             return 'HYBRID'
         elif 'shaq' in agent_module.lower() or agent_class.lower() == 'shaq':
             return 'SHAQ'
@@ -628,8 +633,16 @@ class BenchmarkRunner:
                                     else:
                                         reward = 2.0 / float(visited_time)
                         elif hasattr(webtest.multi_agent_system, 'get_reward'):
-                            # SHAQ/MargD 风格的调用 (web_state, agent_name)
-                            reward = webtest.multi_agent_system.get_reward(web_state, agent_name)
+                            # SHAQ/MargD 风格的调用
+                            import inspect
+                            sig = inspect.signature(webtest.multi_agent_system.get_reward)
+                            param_count = len(sig.parameters)
+                            if param_count >= 3:
+                                # SHAQv2 风格: get_reward(web_state, html, agent_name)
+                                reward = webtest.multi_agent_system.get_reward(web_state, html, agent_name)
+                            else:
+                                # SHAQ/MargD 风格: get_reward(web_state, agent_name)
+                                reward = webtest.multi_agent_system.get_reward(web_state, agent_name)
                     except Exception as e:
                         # 如果有任何错误，记录但不中断
                         pass

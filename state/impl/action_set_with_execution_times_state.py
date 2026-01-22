@@ -20,9 +20,9 @@ class ActionSetWithExecutionTimesState(WebState):
         self.url: str = url
         self.sim_dic = defaultdict(float)
 
-        self.global_url_list = set()  # 用来保存所有网页中可能出现的 URL
-        self.global_form_list = set()  # 用来保存可能的form的操作次数
-        self.global_tag_list = set()  # 用来保存可能的action的type
+        self.global_url_list = set()
+        self.global_form_list = set()
+        self.global_tag_list = set()
 
     def get_action_list(self) -> List[WebAction]:
         action_list = list(self.action_dict.keys())
@@ -48,21 +48,6 @@ class ActionSetWithExecutionTimesState(WebState):
         else:
             raise WebtestException("The action is not exist in the state")
 
-    # def similarity(self, other: 'WebState') -> float:
-    #     if not isinstance(other, ActionSetWithExecutionTimesState):
-    #         return 0
-    #     if not self.sim_dic.__contains__(other):
-    #         action_list_self = set(self.get_action_list())
-    #         action_list_other = set(other.get_action_list())
-    #
-    #         if len(action_list_self) == 0 and len(action_list_other) == 0:
-    #             return 1.0
-    #         intersection = action_list_self.intersection(action_list_other)
-    #         union = action_list_self.union(action_list_other)
-    #         self.sim_dic[other] = len(intersection) / len(union)
-    #         other.sim_dic[other] = len(intersection) / len(union)
-    #     return self.sim_dic[other]
-
     def cosine_similarity(self, X: List[int], Y: List[int]) -> float:
         dot_product = sum(x * y for x, y in zip(X, Y))
         magnitude_X = math.sqrt(sum(x ** 2 for x in X))
@@ -78,7 +63,6 @@ class ActionSetWithExecutionTimesState(WebState):
             if isinstance(action, ClickAction):
                 addition_info = action.addition_info
                 action_counts[action.action_type][addition_info] += 1
-                # 维护全局变量
                 if action.action_type == 'redirect':
                     self.global_url_list.add(addition_info)
                 elif action.action_type == 'submit':
@@ -89,13 +73,10 @@ class ActionSetWithExecutionTimesState(WebState):
                 action_counts['default']['random_input'] += 1
             elif isinstance(action, RandomSelectAction):
                 action_counts['default']['random_select'] += 1
-                # 其他类型的 WebAction 计入 jsevent
         global_url_list_sorted = sorted(self.global_url_list)
         global_form_list_sorted = sorted(self.global_form_list)
         global_tag_list_sorted = sorted(self.global_tag_list)
 
-        # 返回计数字典
-        # 将 Counter 转换为出现次数列表
         result = {}
         for action_type, addition_info_counter in action_counts.items():
             if action_type == "redirect":
@@ -127,20 +108,19 @@ class ActionSetWithExecutionTimesState(WebState):
                 else float(self.cosine_similarity(vector_self['default'], vector_other['default']))
 
             weights = {
-                'redirect': 0.75,  # URL 重定向的权重最大  这里是需要记录网页中url出现的次数 感觉有点不太现实
-                'submit': 0.25,  # Form 提交的权重适中  这里是表单事件，提交之类的
-                'default': 0.1  # JavaScript 事件的权重最小  应该就是我们通俗意义上的action
+                'redirect': 0.75,
+                'submit': 0.25,
+                'default': 0.1
             }
             overall_similarity = float(weights['redirect'] * redirect_similarity +
                                   weights['submit'] * submit_similarity +
                                   weights['default'] * default_similarity)
             self.sim_dic[other] = overall_similarity
-            other.sim_dic[self] = overall_similarity  # 修复：应该用 self 作为键
+            other.sim_dic[self] = overall_similarity
         return self.sim_dic[other]
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, ActionSetWithExecutionTimesState):
-            # 防御性检查：确保两个对象都有 action_dict 属性
             if not hasattr(self, 'action_dict') or not hasattr(other, 'action_dict'):
                 return False
             if not hasattr(self, 'url') or not hasattr(other, 'url'):
@@ -150,7 +130,6 @@ class ActionSetWithExecutionTimesState(WebState):
 
     def __hash__(self) -> int:
         hash_value = 0
-        # 防御性检查：确保 action_dict 存在
         if hasattr(self, 'action_dict'):
             for action in self.action_dict.keys():
                 hash_value += hash(action)

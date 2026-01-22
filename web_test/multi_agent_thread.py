@@ -31,17 +31,35 @@ logger = logging.getLogger(__name__)
 logger.addHandler(LogConfig.get_file_handler())
 
 
+def enable_performance_logging(options: Options) -> Options:
+    """
+    启用 Chrome Performance Logging（用于三层奖励系统的伪 ELOC 指标）
+    
+    这允许获取网络请求、JS 执行等信息，作为代码覆盖率的代理指标。
+    基于 ASE 2024 论文：ELOC 比 Activity Coverage 更能预测 Bug。
+    """
+    # 启用 performance logging
+    options.set_capability('goog:loggingPrefs', {
+        'browser': 'ALL',
+        'performance': 'ALL'
+    })
+    return options
+
+
 class MultiAgentThread(threading.Thread):
     def __init__(self, chrome_options: Options, agent_name: str, multi_agent_system: MultiAgentSystem) -> None:
         super().__init__()
         self.agent_name = agent_name
         self.multi_agent_system = multi_agent_system
-        self.chrome_options = chrome_options
+        
+        # 启用 performance logging（用于三层奖励系统）
+        self.chrome_options = enable_performance_logging(chrome_options)
+        
         self.driver = webdriver.Chrome(
             service=Service(executable_path=settings.driver_path),
             options=self.chrome_options
         )
-        logger.info(f"Thread {self.agent_name}: Webdriver created successfully")
+        logger.info(f"Thread {self.agent_name}: Webdriver created successfully with performance logging")
         self.action_detector_class: type = get_class_by_module_and_class_name(settings.action_detector["module"],
                                                                               settings.action_detector["class"])
         if settings.action_detector["class"] == "CombinationDetector":
@@ -77,7 +95,7 @@ class MultiAgentThread(threading.Thread):
         continuous_restart_count = 0
         while not self.stop_event.is_set():
             try:
-                wait = WebDriverWait(self.driver, 10)  # 设置最长等待时间为10秒
+                wait = WebDriverWait(self.driver, 10)
                 accept_button = wait.until(
                     EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Accept')]")))
                 accept_button.click()
@@ -141,7 +159,6 @@ class MultiAgentThread(threading.Thread):
                 restart_url = self.multi_agent_system.get_restart_url(self.agent_name)
                 new_state = ActionExecuteFailedState(restart_url)
                 self.transit(chosen_action, new_state)
-                # 如果重启仍然失败，多增加一些计数，避免多次在同一个url重启
                 if chosen_action is not None and isinstance(chosen_action, RestartAction):
                     self.multi_agent_system.restart_fail(agent_name=self.agent_name, restart_url=restart_url)
                 if isinstance(e, NoActionsException):
@@ -159,7 +176,6 @@ class MultiAgentThread(threading.Thread):
                     self.multi_agent_system.deal_exception(self.agent_name)
                 except Exception as restart_error:
                     logger.exception(f"Thread {self.agent_name}: Failed to restart webdriver: {restart_error}")
-                    # 如果重启失败，等待一段时间后再尝试
                     self.stop_event.wait(5)
                     try:
                         self.restart_webdriver()
@@ -168,15 +184,13 @@ class MultiAgentThread(threading.Thread):
                         html = self.init_state()
                     except Exception as final_error:
                         logger.exception(f"Thread {self.agent_name}: Final restart attempt failed, exiting: {final_error}")
-                        break  # 退出循环，线程安全结束
-            # 窗口处理也需要保护
+                        break
             try:
                 if len(self.driver.window_handles) > 1:
                     self.driver.switch_to.window(self.driver.window_handles[1])
                     self.close_other_windows()
             except Exception as window_error:
                 logger.warning(f"Thread {self.agent_name}: Failed to handle windows: {window_error}")
-        # 安全退出
         try:
             self.driver.quit()
         except Exception as quit_error:
@@ -191,18 +205,47 @@ class MultiAgentThread(threading.Thread):
                 self.action_dict.setdefault(action, 0)
             self.state_dict[self.current_state] = 1
         html: str = self.driver.page_source
-        self.trace_error()
+        browser_logs, performance_logs = self.trace_error()
         logger.info(f"Thread {self.agent_name}: Initial state: {self.current_state}")
         return html
 
-    def trace_error(self):
+    def trace_error(self) -> Tuple[List[Dict], List[Dict]]:
+        """
+        获取浏览器日志和性能日志
+        
+        Returns:
+            (browser_logs, performance_logs)
+        """
+        browser_logs = []
+        performance_logs = []
+        
         with self.lock:
-            logs = self.driver.get_log("browser")
-            with open(os.path.join(settings.output_path, "bug.log"), "a", encoding="utf-8") as f:
-                for log in logs:
-                    if (log["level"] == "WARNING") or (log["level"] == "SEVERE"):
-                        logger.info(f"Thread {self.agent_name}: Detect browser error: {log}")
-                        f.write(str(log) + "\n")
+            # 获取浏览器日志（错误检测）
+            try:
+                browser_logs = self.driver.get_log("browser")
+                with open(os.path.join(settings.output_path, "bug.log"), "a", encoding="utf-8") as f:
+                    for log in browser_logs:
+                        if (log["level"] == "WARNING") or (log["level"] == "SEVERE"):
+                            logger.info(f"Thread {self.agent_name}: Detect browser error: {log}")
+                            f.write(str(log) + "\n")
+            except Exception as e:
+                logger.debug(f"Thread {self.agent_name}: Failed to get browser logs: {e}")
+            
+            # 获取性能日志（伪 ELOC 指标）
+            try:
+                performance_logs = self.driver.get_log("performance")
+            except Exception as e:
+                logger.debug(f"Thread {self.agent_name}: Failed to get performance logs: {e}")
+        
+        # 存储到 multi_agent_system（供 get_reward 使用）
+        if hasattr(self.multi_agent_system, 'set_agent_logs'):
+            self.multi_agent_system.set_agent_logs(
+                self.agent_name, 
+                browser_logs, 
+                performance_logs
+            )
+        
+        return browser_logs, performance_logs
 
     def transit(self, chosen_action: WebAction, new_state: WebState) -> None:
         if chosen_action is not None:
@@ -237,10 +280,7 @@ class MultiAgentThread(threading.Thread):
         logger.info(f"Thread {self.agent_name}: Webdriver restart successfully")
 
     def stop(self):
-        """停止线程并关闭浏览器"""
-        # 先设置停止标志，让主循环退出
         self.stop_event.set()
-        # 然后关闭浏览器
         try:
             self.driver.quit()
         except Exception as e:
@@ -248,20 +288,12 @@ class MultiAgentThread(threading.Thread):
 
     def save_screen_shot(self):
         if self.screen_shot_count % self.screen_shot_record_round == 0:
-            # Save the original window size
             original_window_size = self.driver.get_window_size()
-
-            # Execute JavaScript to get the full page height
             js = "return Math.max( document.body.scrollHeight, document.body.offsetHeight, document.documentElement.clientHeight, document.documentElement.scrollHeight, document.documentElement.offsetHeight);"
             scroll_height = self.driver.execute_script(js)
-
-            # Set the window size to the full page height and take the screenshot
             self.driver.set_window_size(original_window_size['width'], scroll_height)
             screenshot = self.driver.get_screenshot_as_png()
-
-            # Reset the window size to the original size
             self.driver.set_window_size(original_window_size['width'], original_window_size['height'])
-
             folder_path = os.path.join(settings.output_path, "ScreenShots/agent-" + self.agent_name)
             if not os.path.exists(folder_path):
                 os.makedirs(folder_path)
