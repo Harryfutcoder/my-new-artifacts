@@ -54,6 +54,7 @@ class PerformanceMetrics:
     profile: str = ""
     agent_num: int = 0
     duration_seconds: float = 0.0
+    effective_duration_seconds: float = 0.0  # 有效测试时间（排除异常卡顿）
     
     # 覆盖率指标
     total_states_discovered: int = 0
@@ -65,10 +66,15 @@ class PerformanceMetrics:
     
     # 时间性能
     total_steps: int = 0
-    avg_step_time_ms: float = 0.0
-    max_step_time_ms: float = 0.0
-    min_step_time_ms: float = 0.0
+    avg_decision_time_ms: float = 0.0       # 平均算法决策时间（神经网络推理）
+    avg_step_duration_ms: float = 0.0       # 平均每步端到端时间（总时间/步数）
+    effective_step_duration_ms: float = 0.0  # 有效每步时间（排除异常后）
+    max_decision_time_ms: float = 0.0
+    min_decision_time_ms: float = 0.0
     steps_per_second: float = 0.0
+    effective_steps_per_second: float = 0.0  # 有效吞吐量（排除异常后）
+    anomaly_time_seconds: float = 0.0        # 异常卡顿总时间
+    anomaly_count: int = 0                   # 异常卡顿次数
     
     # 学习性能
     total_reward: float = 0.0
@@ -120,13 +126,18 @@ class PerformanceMetrics:
     
     def summary(self) -> str:
         """生成性能摘要"""
+        # 异常信息
+        anomaly_info = ""
+        if self.anomaly_count > 0:
+            anomaly_info = f"\n║   ⚠ 检测到 {self.anomaly_count} 次异常卡顿，共 {self.anomaly_time_seconds:.1f} 秒"
+        
         return f"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║                    性能测试报告 - {self.algorithm}
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 配置: {self.profile}
 ║ 智能体数量: {self.agent_num}
-║ 测试时长: {self.duration_seconds:.1f} 秒
+║ 测试时长: {self.duration_seconds:.1f} 秒 (有效: {self.effective_duration_seconds:.1f} 秒){anomaly_info}
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【覆盖率指标】
 ║   - 发现状态数: {self.unique_states} (总访问: {self.total_states_discovered})
@@ -136,9 +147,9 @@ class PerformanceMetrics:
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【时间性能】
 ║   - 总步数: {self.total_steps}
-║   - 平均每步时间: {self.avg_step_time_ms:.2f} ms
-║   - 最大步时间: {self.max_step_time_ms:.2f} ms
-║   - 每秒步数: {self.steps_per_second:.2f}
+║   - 平均每步时间: {self.avg_step_duration_ms:.0f} ms (有效: {self.effective_step_duration_ms:.0f} ms)
+║   - 算法决策时间: {self.avg_decision_time_ms:.2f} ms (最大: {self.max_decision_time_ms:.2f} ms)
+║   - 每秒步数: {self.steps_per_second:.3f} (有效: {self.effective_steps_per_second:.3f})
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【学习性能】
 ║   - 累计奖励: {self.total_reward:.2f}
@@ -151,14 +162,14 @@ class PerformanceMetrics:
 ║   - 新状态发现率: {self.new_state_rate:.4f}
 ║   - 探索效率: {self.exploration_efficiency:.4f}
 ║   - 动作多样性: {self.action_diversity:.4f}
-║   - 状态发现速率: {self.unique_states / max(self.duration_seconds, 1) * 60:.2f} 个/分钟
+║   - 状态发现速率: {self.unique_states / max(self.effective_duration_seconds, 1) * 60:.2f} 个/分钟
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【动作类型分布】
 ║   - 点击: {self.click_actions}  输入: {self.input_actions}  选择: {self.select_actions}
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【错误与异常】
 ║   - 动作失败: {self.action_failures}  跳出域名: {self.out_of_domain_count}
-║   - URL 卡住: {self.same_url_stuck_count}
+║   - URL 卡住: {self.same_url_stuck_count}  异常卡顿: {self.anomaly_count} 次
 ╠══════════════════════════════════════════════════════════════════╣
 ║ 【资源使用】
 ║   - 峰值内存: {self.peak_memory_mb:.1f} MB
@@ -288,6 +299,54 @@ class PerformanceMonitor:
             self.losses.append(loss)
             self.metrics.learning_updates += 1
     
+    def _detect_anomalies(self) -> tuple:
+        """
+        检测时间序列中的异常卡顿
+        
+        通过分析 timestamps 数组中相邻时间点的间隔来识别异常。
+        如果某个间隔超过中位数间隔的10倍，则认为是异常卡顿。
+        
+        Returns:
+            (anomaly_total_time, anomaly_count): 异常总时间和异常次数
+        """
+        timestamps = self.metrics.timestamps
+        if len(timestamps) < 3:
+            return 0.0, 0
+        
+        # 计算所有时间间隔
+        intervals = []
+        for i in range(1, len(timestamps)):
+            interval = timestamps[i] - timestamps[i-1]
+            intervals.append(interval)
+        
+        if not intervals:
+            return 0.0, 0
+        
+        # 使用中位数作为正常间隔的参考（比平均值更稳健）
+        sorted_intervals = sorted(intervals)
+        median_interval = sorted_intervals[len(sorted_intervals) // 2]
+        
+        # 异常阈值：中位数的10倍，但至少60秒
+        # （避免正常的页面加载延迟被误判为异常）
+        anomaly_threshold = max(60.0, median_interval * 10)
+        
+        # 检测异常
+        anomaly_total = 0.0
+        anomaly_count = 0
+        
+        for interval in intervals:
+            if interval > anomaly_threshold:
+                # 异常时间 = 实际间隔 - 正常间隔（用中位数估计）
+                anomaly_time = interval - median_interval
+                anomaly_total += anomaly_time
+                anomaly_count += 1
+                logger.warning(f"检测到异常卡顿: {interval:.1f}秒 (正常约 {median_interval:.1f}秒)")
+        
+        if anomaly_count > 0:
+            logger.info(f"共检测到 {anomaly_count} 次异常卡顿，总计 {anomaly_total:.1f} 秒")
+        
+        return anomaly_total, anomaly_count
+    
     def _finalize_metrics(self):
         """计算最终指标"""
         with self.lock:
@@ -296,14 +355,30 @@ class PerformanceMonitor:
             self.metrics.unique_actions = len(self.actions_set)
             self.metrics.unique_urls = len(self.urls_set)
             
+            # 检测异常卡顿（时间间隔超过正常值的10倍视为异常）
+            anomaly_time, anomaly_count = self._detect_anomalies()
+            self.metrics.anomaly_time_seconds = anomaly_time
+            self.metrics.anomaly_count = anomaly_count
+            self.metrics.effective_duration_seconds = max(1, self.metrics.duration_seconds - anomaly_time)
+            
             # 时间性能
             self.metrics.total_steps = len(self.step_times)
             if self.step_times:
-                self.metrics.avg_step_time_ms = sum(self.step_times) / len(self.step_times)
-                self.metrics.max_step_time_ms = max(self.step_times)
-                self.metrics.min_step_time_ms = min(self.step_times)
+                # 决策时间（算法推理时间）
+                self.metrics.avg_decision_time_ms = sum(self.step_times) / len(self.step_times)
+                self.metrics.max_decision_time_ms = max(self.step_times)
+                self.metrics.min_decision_time_ms = min(self.step_times)
+            
+            # 端到端时间（总时间/步数）
+            if self.metrics.total_steps > 0:
+                self.metrics.avg_step_duration_ms = (self.metrics.duration_seconds * 1000) / self.metrics.total_steps
+                self.metrics.effective_step_duration_ms = (self.metrics.effective_duration_seconds * 1000) / self.metrics.total_steps
+            
+            # 吞吐量
             if self.metrics.duration_seconds > 0:
                 self.metrics.steps_per_second = self.metrics.total_steps / self.metrics.duration_seconds
+            if self.metrics.effective_duration_seconds > 0:
+                self.metrics.effective_steps_per_second = self.metrics.total_steps / self.metrics.effective_duration_seconds
             
             # 学习性能
             self.metrics.total_reward = sum(self.rewards)
@@ -767,22 +842,25 @@ class BenchmarkRunner:
             ("动作覆盖", "unique_actions", "个", True),
             ("URL 覆盖", "unique_urls", "个", True),
             ("URL路径覆盖", "unique_url_paths", "个", True),
-            # 时间性能
+            # 时间性能（关键修正：使用有效指标）
             ("总步数", "total_steps", "步", True),
-            ("平均步时间", "avg_step_time_ms", "ms", False),
-            ("每秒步数", "steps_per_second", "步/秒", True),
+            ("有效时长", "effective_duration_seconds", "秒", False),  # 越短越好（同等步数下）
+            ("每步时间", "effective_step_duration_ms", "ms", False),  # 端到端时间，越短越好
+            ("决策时间", "avg_decision_time_ms", "ms", False),  # 算法推理时间
+            ("有效吞吐", "effective_steps_per_second", "步/秒", True),  # 关键指标
+            ("异常卡顿", "anomaly_count", "次", False),  # 越少越好
             # 奖励指标
             ("累计奖励", "total_reward", "", True),
             ("平均奖励", "avg_reward_per_step", "", True),
             ("状态新颖度", "avg_state_novelty", "", True),
-            # 探索效率（新增）
+            # 探索效率
             ("新状态率", "new_state_rate", "", True),
             ("探索效率", "exploration_efficiency", "", True),
             ("动作多样性", "action_diversity", "", True),
-            # 动作类型分布（新增）
+            # 动作类型分布
             ("点击动作", "click_actions", "次", True),
             ("输入动作", "input_actions", "次", True),
-            # 错误发现（新增）
+            # 错误发现
             ("动作失败", "action_failures", "次", False),
             ("跳出域名", "out_of_domain_count", "次", False),
             # 学习和资源
@@ -843,28 +921,40 @@ class BenchmarkRunner:
         return "\n".join(report)
     
     def _calculate_score(self, metrics: PerformanceMetrics) -> float:
-        """计算综合评分"""
+        """
+        计算综合评分
+        
+        评分维度：
+        - 状态覆盖 (30分): 发现的唯一状态数越多越好
+        - 吞吐量 (25分): 有效每秒步数越高越好
+        - 探索效率 (20分): 新状态发现率 + 动作多样性
+        - 稳定性 (15分): 异常卡顿越少越好
+        - 资源效率 (10分): 内存使用越低越好
+        """
         score = 0.0
         
-        # 状态覆盖 (30分)
-        score += min(30, metrics.unique_states / 10 * 30)
+        # 状态覆盖 (30分) - 100个状态得满分
+        score += min(30, metrics.unique_states / 100 * 30)
         
-        # 速度 (20分)
-        if metrics.avg_step_time_ms > 0:
-            speed_score = min(20, 200 / metrics.avg_step_time_ms)
-            score += speed_score
+        # 吞吐量 (25分) - 使用有效每秒步数，0.5步/秒得满分
+        if metrics.effective_steps_per_second > 0:
+            throughput_score = min(25, metrics.effective_steps_per_second / 0.5 * 25)
+            score += throughput_score
         
-        # 奖励 (25分)
-        if metrics.avg_reward_per_step > 0:
-            score += min(25, metrics.avg_reward_per_step * 5)
+        # 探索效率 (20分) - 新状态率和动作多样性各占一半
+        exploration_score = (metrics.new_state_rate + metrics.action_diversity) / 2 * 20
+        score += min(20, exploration_score)
         
-        # 新颖度 (15分)
-        score += metrics.avg_state_novelty * 15
+        # 稳定性 (15分) - 无异常得满分，每次异常扣3分
+        stability_score = max(0, 15 - metrics.anomaly_count * 3)
+        score += stability_score
         
-        # 资源效率 (10分)
+        # 资源效率 (10分) - 500MB以下得满分
         if metrics.peak_memory_mb > 0:
-            mem_score = max(0, 10 - metrics.peak_memory_mb / 100)
+            mem_score = max(0, 10 - max(0, metrics.peak_memory_mb - 500) / 100)
             score += mem_score
+        else:
+            score += 10  # 无数据时给满分
         
         return min(100, score)
     
