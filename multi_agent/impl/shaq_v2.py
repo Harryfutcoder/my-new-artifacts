@@ -62,6 +62,7 @@ class DOMStructureEncoder:
     - 预编译正则表达式
     - LRU 缓存避免重复计算
     - 简化的快速路径
+    - 【新增】嘈杂电视机过滤（Noisy TV Problem）
     """
     
     def __init__(self):
@@ -76,6 +77,24 @@ class DOMStructureEncoder:
             for tag in self.structure_tags + self.interactive_tags
         }
         
+        # 【新增】嘈杂电视机过滤器（Noisy TV Problem）
+        # 这些模式表示动态/随机内容，不应影响状态判断
+        self._noisy_patterns = [
+            re.compile(r'\b\d{10,13}\b'),           # Unix 时间戳
+            re.compile(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}'),  # ISO 日期时间
+            re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', re.I),  # UUID
+            re.compile(r'id="[^"]*\d{5,}[^"]*"'),   # 带长数字的 ID
+            re.compile(r'data-random="[^"]*"'),     # 随机数据属性
+            re.compile(r'nonce="[^"]*"'),           # CSP nonce
+            re.compile(r'data-timestamp="[^"]*"'),  # 时间戳属性
+            re.compile(r'data-token="[^"]*"'),      # Token 属性
+            re.compile(r'style="[^"]*animation[^"]*"', re.I),  # 动画样式
+            re.compile(r'class="[^"]*loading[^"]*"', re.I),    # Loading 类
+            re.compile(r'class="[^"]*spinner[^"]*"', re.I),    # Spinner 类
+            re.compile(r'class="[^"]*carousel[^"]*"', re.I),   # 轮播图类
+            re.compile(r'class="[^"]*slider[^"]*"', re.I),     # 滑块类
+        ]
+        
         # LRU 缓存：避免重复计算相同 HTML 的签名
         self._signature_cache: Dict[int, str] = {}
         self._hash_cache: Dict[int, str] = {}
@@ -89,8 +108,30 @@ class DOMStructureEncoder:
         key_str = f"{len(html)}:{html[:100]}:{html[-100:] if len(html) > 100 else ''}"
         return hash(key_str)
     
-    def extract_structure_signature(self, html: str) -> str:
-        """提取 DOM 结构签名（带缓存）"""
+    def filter_noisy_content(self, html: str) -> str:
+        """
+        过滤嘈杂内容（Noisy TV Problem 防护）
+        
+        问题：动态元素（轮播图、时间戳、Loading）会让 ICM 误认为是高价值区域
+        解决：移除这些随机/动态特征，确保状态特征是"纯净"的业务逻辑
+        """
+        if not html:
+            return html
+        
+        filtered = html
+        for pattern in self._noisy_patterns:
+            filtered = pattern.sub('', filtered)
+        
+        return filtered
+    
+    def extract_structure_signature(self, html: str, filter_noise: bool = True) -> str:
+        """
+        提取 DOM 结构签名（带缓存）
+        
+        Args:
+            html: HTML 内容
+            filter_noise: 是否过滤嘈杂内容（默认 True）
+        """
         if not html:
             return ""
         
@@ -99,17 +140,20 @@ class DOMStructureEncoder:
         if cache_key in self._signature_cache:
             return self._signature_cache[cache_key]
         
+        # 【新增】过滤嘈杂内容
+        clean_html = self.filter_noisy_content(html) if filter_noise else html
+        
         # 快速统计各标签数量
         tag_counts = []
         interactive_count = 0
         
         for tag in self.structure_tags:
-            count = len(self._tag_patterns[tag].findall(html))
+            count = len(self._tag_patterns[tag].findall(clean_html))
             if count > 0:
                 tag_counts.append(f"{tag}:{count}")
         
         for tag in self.interactive_tags:
-            interactive_count += len(self._tag_patterns[tag].findall(html))
+            interactive_count += len(self._tag_patterns[tag].findall(clean_html))
         
         tag_counts.append(f"i:{interactive_count}")
         signature = "|".join(tag_counts)
@@ -207,6 +251,11 @@ class PseudoELOCTracker:
         # 追踪已见过的 API 端点（去参数）
         self.seen_api_endpoints: Set[str] = set()
         self.seen_request_patterns: Set[str] = set()
+        
+        # 【新增】API 响应结构追踪（用于计算熵）
+        # 即使 URL 相同，不同的响应结构说明触发了不同的服务器逻辑
+        self.api_response_structures: Dict[str, Set[str]] = defaultdict(set)  # endpoint -> {structure_hash, ...}
+        self.api_response_history: List[str] = []  # 用于计算熵
         
         # 追踪 DOM 复杂度历史
         self.dom_complexity_history: List[float] = []
@@ -406,8 +455,125 @@ class PseudoELOCTracker:
             'complexity_delta': complexity_delta,
         }
     
+    def extract_response_structure(self, response_body: str) -> str:
+        """
+        提取 API 响应的结构签名（不含具体值）
+        
+        即使 URL 相同，不同的响应结构说明触发了不同的服务器逻辑
+        这是 ASE 2024 论文中 ELOC 的核心思想
+        
+        Example:
+            {"users": [{"id": 1, "name": "Alice"}]} → {"users": [{"id": "N", "name": "S"}]}
+        """
+        try:
+            import json
+            data = json.loads(response_body)
+            return self._structure_signature(data)
+        except:
+            # 非 JSON 响应，使用长度和关键特征
+            return f"raw:{len(response_body) // 100}"
+    
+    def _structure_signature(self, obj, depth: int = 0) -> str:
+        """递归提取 JSON 结构签名"""
+        if depth > 5:  # 限制深度
+            return "..."
+        
+        if isinstance(obj, dict):
+            keys = sorted(obj.keys())[:10]  # 限制 key 数量
+            sig_parts = [f"{k}:{self._structure_signature(obj[k], depth+1)}" for k in keys]
+            return "{" + ",".join(sig_parts) + "}"
+        elif isinstance(obj, list):
+            if len(obj) == 0:
+                return "[]"
+            # 只看第一个元素的结构
+            return f"[{self._structure_signature(obj[0], depth+1)}]"
+        elif isinstance(obj, str):
+            return "S"
+        elif isinstance(obj, (int, float)):
+            return "N"
+        elif isinstance(obj, bool):
+            return "B"
+        elif obj is None:
+            return "null"
+        else:
+            return "?"
+    
+    def record_api_response(self, endpoint: str, response_body: str) -> Dict[str, float]:
+        """
+        记录 API 响应并计算新颖度
+        
+        Returns:
+            {
+                'is_new_structure': bool,  # 是否是新的响应结构
+                'structure_entropy': float,  # 当前 endpoint 的响应结构熵
+                'novelty_reward': float,  # 建议的奖励值
+            }
+        """
+        structure = self.extract_response_structure(response_body)
+        structure_hash = hashlib.md5(structure.encode()).hexdigest()[:8]
+        
+        # 记录到历史
+        self.api_response_history.append(structure_hash)
+        if len(self.api_response_history) > 1000:
+            self.api_response_history = self.api_response_history[-1000:]
+        
+        # 检查是否是新结构
+        is_new = structure_hash not in self.api_response_structures[endpoint]
+        self.api_response_structures[endpoint].add(structure_hash)
+        
+        # 计算该 endpoint 的响应多样性（熵）
+        structures = self.api_response_structures[endpoint]
+        entropy = self._compute_entropy(structures)
+        
+        # 计算奖励：新结构给予高奖励
+        novelty_reward = 0.0
+        if is_new:
+            # 新响应结构！这说明触发了不同的服务器逻辑
+            novelty_reward = 60.0  # 高于新 URL 的奖励
+            if len(structures) == 1:
+                # 全新的 endpoint + 全新的结构
+                novelty_reward = 80.0
+        
+        return {
+            'is_new_structure': is_new,
+            'structure_entropy': entropy,
+            'novelty_reward': novelty_reward,
+            'unique_structures': len(structures),
+        }
+    
+    def _compute_entropy(self, items: Set[str]) -> float:
+        """计算熵（多样性指标）"""
+        if len(items) <= 1:
+            return 0.0
+        # 简化：假设均匀分布
+        n = len(items)
+        return math.log2(n) if n > 0 else 0.0
+    
+    def compute_api_diversity_reward(self) -> float:
+        """
+        计算整体 API 多样性奖励
+        
+        基于 ASE 2024 论文：API 调用多样性与 Bug 发现高度相关
+        """
+        total_structures = sum(len(s) for s in self.api_response_structures.values())
+        total_endpoints = len(self.api_response_structures)
+        
+        if total_endpoints == 0:
+            return 0.0
+        
+        # 平均每个 endpoint 的结构多样性
+        avg_diversity = total_structures / total_endpoints
+        
+        # 归一化到 0-50 的奖励范围
+        return min(50.0, avg_diversity * 10.0)
+    
     def get_pseudo_eloc_summary(self) -> Dict:
         """获取伪 ELOC 摘要"""
+        # 计算整体 API 熵
+        total_api_entropy = 0.0
+        for endpoint, structures in self.api_response_structures.items():
+            total_api_entropy += self._compute_entropy(structures)
+        
         return {
             'total_api_endpoints': len(self.seen_api_endpoints),
             'total_request_patterns': len(self.seen_request_patterns),
@@ -415,7 +581,13 @@ class PseudoELOCTracker:
             'total_requests': self.total_requests,
             'js_execution_count': self.js_execution_count,
             'max_dom_depth': self.max_dom_depth_seen,
-            'api_endpoints_list': list(self.seen_api_endpoints)[:20],  # 前 20 个
+            'api_endpoints_list': list(self.seen_api_endpoints)[:20],
+            # 【新增】API 响应多样性指标
+            'api_response_diversity': {
+                'total_unique_structures': sum(len(s) for s in self.api_response_structures.values()),
+                'endpoints_with_multiple_structures': sum(1 for s in self.api_response_structures.values() if len(s) > 1),
+                'total_api_entropy': total_api_entropy,
+            }
         }
 
 
@@ -431,9 +603,11 @@ class IntrinsicCuriosityModule(nn.Module):
     - 更小的网络结构
     - 计算频率控制
     - 缓存机制
+    - 【新增】时间衰减（解决嘈杂电视机问题）
     """
     
-    def __init__(self, state_dim: int = 32, action_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, state_dim: int = 32, action_dim: int = 8, hidden_dim: int = 32,
+                 alive_time: float = 10800):
         super().__init__()
         
         self.state_dim = state_dim
@@ -464,6 +638,14 @@ class IntrinsicCuriosityModule(nn.Module):
         self.compute_interval = 3
         self.step_counter = 0
         self.cached_reward = 0.05  # 默认好奇心奖励
+        
+        # 【新增】时间衰减机制（解决嘈杂电视机问题）
+        # 原理：后期应让位给真正的 R_ext（三层奖励系统）
+        self.start_time = datetime.now()
+        self.alive_time = alive_time
+        self.decay_start = 0.3   # 30% 时间后开始衰减
+        self.decay_end = 0.8     # 80% 时间后衰减到最小
+        self.min_weight = 0.1    # 最小权重（不完全关闭）
     
     def encode_state(self, state_tensor: torch.Tensor) -> torch.Tensor:
         """编码状态"""
@@ -474,6 +656,27 @@ class IntrinsicCuriosityModule(nn.Module):
         combined = torch.cat([state_encoded, action_tensor], dim=-1)
         return self.forward_model(combined)
     
+    def get_decay_weight(self) -> float:
+        """
+        计算时间衰减权重
+        
+        【新增】解决嘈杂电视机问题：
+        - 早期（0-30%）：好奇心奖励全力工作，驱动初始探索
+        - 中期（30-80%）：逐渐衰减，让位给 R_ext
+        - 后期（80-100%）：几乎关闭，专注于三层奖励系统
+        """
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        progress = min(1.0, elapsed / self.alive_time)
+        
+        if progress < self.decay_start:
+            return 1.0
+        elif progress > self.decay_end:
+            return self.min_weight
+        else:
+            # 线性衰减
+            decay_progress = (progress - self.decay_start) / (self.decay_end - self.decay_start)
+            return 1.0 - (1.0 - self.min_weight) * decay_progress
+    
     def compute_intrinsic_reward(
         self, 
         state_tensor: torch.Tensor = None, 
@@ -483,7 +686,9 @@ class IntrinsicCuriosityModule(nn.Module):
         """
         计算内在奖励（好奇心奖励）- 优化版
         
-        优化：每 N 步才真正计算一次，其他时候返回缓存值
+        优化：
+        - 每 N 步才真正计算一次，其他时候返回缓存值
+        - 【新增】时间衰减，后期让位给 R_ext
         """
         self.step_counter += 1
         
@@ -521,7 +726,10 @@ class IntrinsicCuriosityModule(nn.Module):
                 else:
                     normalized_error = min(1.0, prediction_error)
                 
-                self.cached_reward = self.eta * normalized_error
+                # 【新增】应用时间衰减
+                decay_weight = self.get_decay_weight()
+                self.cached_reward = self.eta * normalized_error * decay_weight
+                
                 return self.cached_reward
         except Exception:
             return self.cached_reward
@@ -597,36 +805,61 @@ class MultiObjectiveRewardSystem:
         self.R_CONSOLE_ERROR = 200.0     # 控制台错误
         
         # ============================================================
-        # 【核心层】伪 ELOC - 论文重点！
+        # 【核心层】伪 ELOC - 论文重点！（强化！）
         # 论文证明：ELOC 比 Activity Coverage 更能预测 Bug
+        # 
+        # 【重要修改】大幅提高核心层权重
+        # 原因：Web 测试的目的是发现 Bug 和覆盖代码，不仅仅是跳转 URL
         # ============================================================
-        self.R_NEW_API_ENDPOINT = 30.0   # 新 API 端点 → Method Coverage
-        self.R_REQUEST_DIVERSITY = 15.0  # 请求多样性 → Instruction Coverage
-        self.R_DOM_COMPLEXITY_INCREASE = 20.0  # DOM 复杂度增加 → Branch Coverage
-        self.R_NEW_DOMAIN = 25.0         # 新域名请求 → 跨模块覆盖
-        self.R_JS_EXECUTION = 5.0        # JS 执行 → ELOC
+        self.R_NEW_API_ENDPOINT = 50.0   # 新 API 端点 → Method Coverage（提高！比 URL 更重要）
+        self.R_REQUEST_DIVERSITY = 25.0  # 请求多样性 → Instruction Coverage（提高）
+        self.R_DOM_COMPLEXITY_INCREASE = 35.0  # DOM 复杂度增加 → Branch Coverage（提高！）
+        self.R_NEW_DOMAIN = 30.0         # 新域名请求 → 跨模块覆盖
+        self.R_JS_EXECUTION = 10.0       # JS 执行 → ELOC
+        self.R_DOM_STRUCTURE_CHANGE = 40.0  # DOM 结构变化（即使 URL 不变）
+        # 【新增】API 响应熵奖励 - ASE 2024 核心洞察
+        # 即使 URL 相同，不同响应结构 = 触发不同服务器逻辑 = 更高 ELOC
+        self.R_NEW_API_RESPONSE_STRUCTURE = 60.0  # 新响应结构（比新 URL 更重要！）
+        self.R_API_DIVERSITY_BONUS = 20.0         # API 多样性奖励
         
         # ============================================================
         # 【基础层】Activity Coverage - 最低优先级（可能误导！）
         # 论文警告：这个指标与 Bug 相关性不稳定
+        # 【重要修改】降低基础层权重，避免仅追求 URL 跳转
         # ============================================================
-        self.R_NEW_STATE = 5.0           # 降低权重！
-        self.R_NEW_URL = 10.0            # 降低权重！
-        self.R_NEW_ACTION = 3.0          # 降低权重！
-        self.R_DEPTH_BONUS = 8.0         # URL 深度
+        self.R_NEW_STATE = 3.0           # 进一步降低
+        self.R_NEW_URL = 8.0             # 进一步降低（API 变化 > URL 变化）
+        self.R_NEW_ACTION = 2.0          # 进一步降低
+        self.R_DEPTH_BONUS = 5.0         # URL 深度降低
         
         # 惩罚
         self.R_PENALTY = -1.0
         
-        # ========== 动态权重（三层） ==========
-        # 早期：核心层高，目标层低（建立 ELOC 基础）
-        # 中期：均衡
-        # 后期：目标层高（专注找 Bug）
+        # ========== 【新增】协同增益 (Synergy Boost) ==========
+        # 博弈论：超级加法 v(S∪T) ≥ v(S) + v(T)
+        # 当多个 Agent 短时间内共同贡献时，给予额外奖励
+        self.R_SYNERGY_BOOST = 30.0       # 协同奖励基础值
+        self.SYNERGY_WINDOW_STEPS = 5     # 协同窗口：5 步内
+        self.recent_contributions: List[Dict] = []  # 近期贡献记录
+        self.synergy_total = 0.0          # 协同奖励累计
+        self.synergy_count = 0            # 协同触发次数
+        
+        # ========== 【新增】边际效用递减的动态权重 ==========
+        # 不再手动划分"前中后期"，基于增长率自动调整
         self.tier_weights = {
-            'target': 1.0,   # 目标层基础权重
-            'core': 1.0,     # 核心层基础权重
-            'base': 1.0,     # 基础层基础权重
+            'target': 1.0,
+            'core': 1.0,
+            'base': 1.0,
         }
+        # 增长率追踪
+        self.metric_history: Dict[str, List[int]] = {
+            'url': [],
+            'api': [],
+            'state': [],
+        }
+        self.history_step_counter = 0
+        self.HISTORY_INTERVAL = 10        # 每 10 步记录一次
+        self.GROWTH_THRESHOLD = 0.5       # 增长率低于此值视为"饱和"
         
         # 追踪
         self.visited_states: Set[int] = set()
@@ -699,6 +932,185 @@ class MultiObjectiveRewardSystem:
                 'base': 0.5,   # 降低 Activity 权重
             }
     
+    # ========== 【新增】协同增益系统 ==========
+    
+    def record_contribution(self, agent_name: str, contrib_type: str, value: float = 1.0):
+        """
+        记录 Agent 的贡献（用于协同增益计算）
+        
+        Args:
+            agent_name: Agent 名称
+            contrib_type: 贡献类型 ('api', 'dom_change', 'url', 'form_submit')
+            value: 贡献值
+        """
+        self.recent_contributions.append({
+            'agent': agent_name,
+            'type': contrib_type,
+            'step': self.history_step_counter,
+            'value': value,
+        })
+        # 只保留最近的贡献
+        window_start = self.history_step_counter - self.SYNERGY_WINDOW_STEPS
+        self.recent_contributions = [
+            c for c in self.recent_contributions 
+            if c['step'] >= window_start
+        ]
+    
+    def compute_synergy_boost(self, agent_name: str, contrib_type: str) -> float:
+        """
+        计算协同增益
+        
+        博弈论原理：超级加法 v(S∪T) ≥ v(S) + v(T)
+        
+        场景：Agent A 填表，Agent B 提交 → 触发 API
+        如果没有协同奖励，功劳只归 B。加入协同后，A 也能分到。
+        
+        Returns:
+            协同奖励值（如果没有协同则为 0）
+        """
+        if len(self.recent_contributions) < 2:
+            return 0.0
+        
+        # 找到窗口内其他 Agent 的相关贡献
+        window_start = self.history_step_counter - self.SYNERGY_WINDOW_STEPS
+        related_contribs = [
+            c for c in self.recent_contributions
+            if c['step'] >= window_start 
+            and c['agent'] != agent_name
+            and self._is_synergy_pair(c['type'], contrib_type)
+        ]
+        
+        if not related_contribs:
+            return 0.0
+        
+        # 计算协同奖励
+        # 参与的 Agent 越多，协同奖励越高
+        unique_agents = set(c['agent'] for c in related_contribs)
+        synergy_multiplier = 1.0 + 0.2 * len(unique_agents)  # 每多一个 Agent 加 20%
+        
+        synergy_reward = self.R_SYNERGY_BOOST * synergy_multiplier
+        
+        self.synergy_total += synergy_reward
+        self.synergy_count += 1
+        
+        logger.debug(f"[协同增益] Agent {agent_name} 触发 {contrib_type}，"
+                    f"与 {unique_agents} 协同，奖励 +{synergy_reward:.1f}")
+        
+        return synergy_reward
+    
+    def _is_synergy_pair(self, type1: str, type2: str) -> bool:
+        """
+        判断两种贡献类型是否构成协同对
+        
+        协同对示例：
+        - form_input + form_submit → API 触发
+        - navigation + dom_change → 页面探索
+        """
+        synergy_pairs = {
+            ('form_input', 'api'),
+            ('form_input', 'form_submit'),
+            ('navigation', 'api'),
+            ('navigation', 'dom_change'),
+            ('click', 'api'),
+            ('click', 'dom_change'),
+            ('dom_change', 'api'),
+        }
+        pair = tuple(sorted([type1, type2]))
+        return pair in synergy_pairs or (type1, type2) in synergy_pairs or (type2, type1) in synergy_pairs
+    
+    # ========== 【新增】边际效用递减的动态权重 ==========
+    
+    def update_metric_history(self):
+        """
+        更新指标历史（每 N 步调用一次）
+        用于计算增长率和边际效用
+        """
+        self.history_step_counter += 1
+        
+        if self.history_step_counter % self.HISTORY_INTERVAL != 0:
+            return
+        
+        # 记录当前指标
+        self.metric_history['url'].append(len(self.visited_urls))
+        self.metric_history['api'].append(len(self.pseudo_eloc_tracker.seen_api_endpoints))
+        self.metric_history['state'].append(len(self.visited_states))
+        
+        # 只保留最近 10 个记录点
+        for key in self.metric_history:
+            if len(self.metric_history[key]) > 10:
+                self.metric_history[key] = self.metric_history[key][-10:]
+    
+    def get_adaptive_tier_weights(self) -> Dict[str, float]:
+        """
+        基于边际效用递减的自适应权重
+        
+        经济学原理：随着某指标数量增加，每新增一个的价值递减
+        
+        逻辑：
+        - 如果 URL 增长放缓（边际效用低）→ 降低基础层权重
+        - 如果 API 增长放缓 → 降低核心层权重
+        - 将权重转移到仍有增长空间的层级
+        """
+        # 默认权重（如果数据不足）
+        base_weights = {'target': 1.0, 'core': 1.0, 'base': 1.0}
+        
+        # 需要至少 3 个数据点才能计算增长率
+        if len(self.metric_history['url']) < 3:
+            return self.get_three_tier_weights()  # 回退到时间阶段方法
+        
+        # 计算各指标的增长率（最近 vs 之前）
+        url_growth = self._compute_growth_rate(self.metric_history['url'])
+        api_growth = self._compute_growth_rate(self.metric_history['api'])
+        state_growth = self._compute_growth_rate(self.metric_history['state'])
+        
+        weights = base_weights.copy()
+        
+        # 边际效用递减逻辑
+        if url_growth < self.GROWTH_THRESHOLD:
+            # URL 增长放缓 → 基础层（Activity）边际效用低
+            weights['base'] *= 0.6
+            weights['core'] *= 1.3  # 转向深度挖掘
+            logger.debug(f"[动态权重] URL 增长放缓 ({url_growth:.2f})，降低基础层权重")
+        
+        if api_growth < self.GROWTH_THRESHOLD:
+            # API 增长放缓 → 核心层边际效用低
+            weights['core'] *= 0.8
+            weights['target'] *= 1.3  # 转向找 Bug
+            logger.debug(f"[动态权重] API 增长放缓 ({api_growth:.2f})，转向目标层")
+        
+        if state_growth > self.GROWTH_THRESHOLD * 2:
+            # 状态发现仍然活跃 → 保持探索
+            weights['base'] *= 1.2
+            logger.debug(f"[动态权重] 状态发现活跃 ({state_growth:.2f})，保持探索")
+        
+        # 归一化（可选）
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v * 3.0 / total for k, v in weights.items()}
+        
+        return weights
+    
+    def _compute_growth_rate(self, history: List[int]) -> float:
+        """
+        计算增长率
+        
+        公式：(recent_growth) / (earlier_growth + epsilon)
+        值 < 1 表示增长在放缓
+        """
+        if len(history) < 3:
+            return 1.0
+        
+        # 最近的增长
+        recent_growth = history[-1] - history[-2]
+        # 之前的增长
+        earlier_growth = history[-2] - history[-3]
+        
+        # 避免除零
+        if earlier_growth <= 0:
+            return 2.0 if recent_growth > 0 else 0.5
+        
+        return recent_growth / earlier_growth
+    
     def get_coverage_metrics(self) -> Dict:
         """获取当前指标"""
         return {
@@ -745,14 +1157,29 @@ class MultiObjectiveRewardSystem:
             # 【新增】三层分析
             'three_tier_analysis': {
                 'tier_weights': self.get_three_tier_weights(),
+                'adaptive_weights': self.get_adaptive_tier_weights(),  # 【新增】
                 'tier_totals': self.tier_reward_totals,
                 'tier_ratios': tier_ratios,
                 'pseudo_eloc': self.pseudo_eloc_tracker.get_pseudo_eloc_summary(),
+            },
+            # 【新增】协同增益分析
+            'synergy_analysis': {
+                'synergy_total': self.synergy_total,
+                'synergy_count': self.synergy_count,
+                'avg_synergy': self.synergy_total / max(self.synergy_count, 1),
+                'recent_contributions': len(self.recent_contributions),
+            },
+            # 【新增】边际效用分析
+            'marginal_utility_analysis': {
+                'url_history': self.metric_history['url'][-5:] if self.metric_history['url'] else [],
+                'api_history': self.metric_history['api'][-5:] if self.metric_history['api'] else [],
+                'state_history': self.metric_history['state'][-5:] if self.metric_history['state'] else [],
             },
             'interpretation': {
                 'error_driven': error_ratio > 0.3,
                 'exploration_effective': metrics['state_coverage'] > 5,
                 'eloc_effective': len(self.pseudo_eloc_tracker.seen_api_endpoints) > 3,
+                'synergy_active': self.synergy_count > 0,  # 【新增】
             }
         }
     
@@ -763,23 +1190,32 @@ class MultiObjectiveRewardSystem:
         action: Optional[WebAction] = None,
         browser_logs: List[Dict] = None,
         performance_logs: List[Dict] = None,
-        http_status: int = 200
+        http_status: int = 200,
+        agent_name: str = None  # 【新增】用于协同增益计算
     ) -> Tuple[float, Dict[str, float]]:
         """
         三层奖励计算（基于 ASE 2024 论文）
         
-        R_total = w_target × R_target + w_core × R_core + w_base × R_base
+        R_total = w_target × R_target + w_core × R_core + w_base × R_base + R_synergy
+        
+        【新增】协同增益：当多个 Agent 短时间内共同贡献时，额外奖励
+        【新增】边际效用递减：基于增长率自动调整层级权重
         
         Args:
             browser_logs: 从 driver.get_log("browser") 获取
             performance_logs: 从 driver.get_log("performance") 获取
+            agent_name: Agent 名称（用于协同增益）
             
         Returns:
             (total_reward, breakdown_dict)
         """
+        # 【新增】更新指标历史（用于边际效用计算）
+        self.update_metric_history()
+        
         target_reward = 0.0   # 目标层
         core_reward = 0.0     # 核心层
         base_reward = 0.0     # 基础层
+        synergy_reward = 0.0  # 【新增】协同奖励
         breakdown = {}
         
         # ============================================================
@@ -817,6 +1253,14 @@ class MultiObjectiveRewardSystem:
                 api_reward = self.R_NEW_API_ENDPOINT * eloc_metrics['new_api_endpoints']
                 core_reward += api_reward
                 breakdown['core:new_api_endpoint'] = api_reward
+                
+                # 【新增】记录贡献 + 计算协同增益
+                if agent_name:
+                    self.record_contribution(agent_name, 'api', eloc_metrics['new_api_endpoints'])
+                    synergy = self.compute_synergy_boost(agent_name, 'api')
+                    if synergy > 0:
+                        synergy_reward += synergy
+                        breakdown['synergy:api'] = synergy
             
             # 新请求模式 → Instruction Coverage
             if eloc_metrics['total_new_requests'] > 0:
@@ -833,10 +1277,35 @@ class MultiObjectiveRewardSystem:
         # DOM 复杂度变化 → Branch Coverage
         if html:
             dom_metrics = self.pseudo_eloc_tracker.compute_dom_complexity(html)
+            
+            # 【强化】DOM 复杂度增加的奖励
             if dom_metrics['complexity_delta'] > 0.05:
                 complexity_reward = self.R_DOM_COMPLEXITY_INCREASE * dom_metrics['complexity_delta'] * 10
                 core_reward += complexity_reward
                 breakdown['core:dom_complexity'] = complexity_reward
+            
+            # 【新增】DOM 结构显著变化奖励
+            # 理论依据：即使 URL 没变，DOM 结构变化说明触发了代码路径
+            # 这是 SHAQ 比 QMIX 的关键优势场景："填表->提交" 的多步依赖
+            if dom_metrics['complexity_delta'] > 0.15:
+                structure_change_reward = self.R_DOM_STRUCTURE_CHANGE
+                core_reward += structure_change_reward
+                breakdown['core:dom_structure_change'] = structure_change_reward
+                
+                # 【新增】记录 DOM 变化贡献 + 协同增益
+                if agent_name:
+                    self.record_contribution(agent_name, 'dom_change', dom_metrics['complexity_delta'])
+                    synergy = self.compute_synergy_boost(agent_name, 'dom_change')
+                    if synergy > 0:
+                        synergy_reward += synergy
+                        breakdown['synergy:dom_change'] = synergy
+            
+            # 【新增】交互元素数量变化奖励
+            # 新增交互元素说明进入了新的功能区域
+            if dom_metrics.get('interactive', 0) > 0.3:
+                interactive_bonus = self.R_JS_EXECUTION * 2
+                core_reward += interactive_bonus
+                breakdown['core:interactive_elements'] = interactive_bonus
         
         # ============================================================
         # 【基础层】Activity Coverage（权重较低）
@@ -869,14 +1338,16 @@ class MultiObjectiveRewardSystem:
                 self.visited_actions.add(action_hash)
         
         # ============================================================
-        # 动态加权
+        # 动态加权（【改进】使用边际效用递减的自适应权重）
         # ============================================================
-        weights = self.get_three_tier_weights()
+        weights = self.get_adaptive_tier_weights()
         
+        # 三层奖励 + 协同奖励
         total_reward = (
             weights['target'] * target_reward +
             weights['core'] * core_reward +
-            weights['base'] * base_reward
+            weights['base'] * base_reward +
+            synergy_reward  # 协同奖励不加权，直接叠加
         )
         
         # 记录统计
@@ -892,6 +1363,7 @@ class MultiObjectiveRewardSystem:
         breakdown['_target_reward'] = target_reward
         breakdown['_core_reward'] = core_reward
         breakdown['_base_reward'] = base_reward
+        breakdown['_synergy_reward'] = synergy_reward  # 【新增】
         
         for key, value in breakdown.items():
             if not key.startswith('_'):
@@ -1102,21 +1574,94 @@ class RoleBasedRewardSystem:
         # ========== JBS 检测 ==========
         self.url_visit_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))  # url -> {agent -> count}
         self.jbs_events: List[Dict] = []  # 记录 JBS 事件
+        
+        # ========== 【新增】动态角色切换系统 ==========
+        # 基于 Shapley 值的动态角色重塑
+        # 核心思想：如果一个 Exploiter 连续 N 步边际贡献接近 0，
+        # 说明当前局部状态已被榨干，应强制切换为 Explorer
+        self.agent_roles: Dict[str, str] = {}  # 当前角色分配
+        self.agent_shapley_history: Dict[str, List[float]] = defaultdict(list)  # Shapley 值历史
+        self.role_switch_count: Dict[str, int] = defaultdict(int)  # 角色切换次数
+        self.LOW_CONTRIBUTION_THRESHOLD = 0.5  # Shapley 值低于平均的这个比例视为低贡献
+        self.CONSECUTIVE_LOW_STEPS = 10  # 连续低贡献步数阈值
+        
+        # 初始化角色（奇偶分配）
+        for i in range(agent_num):
+            self.agent_roles[str(i)] = 'explorer' if i % 2 == 0 else 'exploiter'
+    
+    def update_shapley_history(self, agent_name: str, shapley_value: float, avg_shapley: float):
+        """
+        更新 Shapley 值历史并检查是否需要角色切换
+        
+        Args:
+            agent_name: Agent 名称
+            shapley_value: 当前 Shapley 值
+            avg_shapley: 平均 Shapley 值（1/N）
+        """
+        history = self.agent_shapley_history[agent_name]
+        history.append(shapley_value)
+        
+        # 保留最近 100 步
+        if len(history) > 100:
+            self.agent_shapley_history[agent_name] = history[-100:]
+        
+        # 检查是否需要角色切换
+        self._check_role_switch(agent_name, avg_shapley)
+    
+    def _check_role_switch(self, agent_name: str, avg_shapley: float):
+        """
+        检查是否需要角色切换
+        
+        规则：
+        1. Exploiter 连续低贡献 → 切换为 Explorer（当前局部已榨干）
+        2. Explorer 持续高贡献 → 切换为 Exploiter（发现了好区域）
+        """
+        history = self.agent_shapley_history[agent_name]
+        if len(history) < self.CONSECUTIVE_LOW_STEPS:
+            return
+        
+        current_role = self.agent_roles.get(agent_name, 'explorer')
+        recent_history = history[-self.CONSECUTIVE_LOW_STEPS:]
+        threshold = avg_shapley * self.LOW_CONTRIBUTION_THRESHOLD
+        
+        # 检查连续低贡献
+        consecutive_low = all(s < threshold for s in recent_history)
+        # 检查持续高贡献
+        high_threshold = avg_shapley * 1.5
+        consecutive_high = all(s > high_threshold for s in recent_history)
+        
+        new_role = current_role
+        switch_reason = None
+        
+        if current_role == 'exploiter' and consecutive_low:
+            # Exploiter 废了 → 强制切换为 Explorer
+            new_role = 'explorer'
+            switch_reason = f"连续{self.CONSECUTIVE_LOW_STEPS}步低贡献(Shapley<{threshold:.3f})"
+        elif current_role == 'explorer' and consecutive_high:
+            # Explorer 发现了好区域 → 切换为 Exploiter 深挖
+            new_role = 'exploiter'
+            switch_reason = f"连续{self.CONSECUTIVE_LOW_STEPS}步高贡献(Shapley>{high_threshold:.3f})"
+        
+        if new_role != current_role:
+            self.agent_roles[agent_name] = new_role
+            self.role_switch_count[agent_name] += 1
+            # 清空历史，重新开始计数
+            self.agent_shapley_history[agent_name] = []
+            logger.info(f"[角色切换] Agent {agent_name}: {current_role} → {new_role} ({switch_reason})")
     
     def get_agent_role(self, agent_name: str) -> str:
         """
-        动态确定 Agent 角色
-        
-        可以基于：
-        1. 固定分配（简单）
-        2. 历史表现（自适应）
+        获取 Agent 当前角色（支持动态切换）
         """
-        # 简单方案：奇偶分配
-        agent_id = int(agent_name)
-        if agent_id % 2 == 0:
-            return 'explorer'
-        else:
-            return 'exploiter'
+        return self.agent_roles.get(agent_name, 'explorer')
+    
+    def get_role_switch_stats(self) -> Dict:
+        """获取角色切换统计"""
+        return {
+            'current_roles': dict(self.agent_roles),
+            'switch_counts': dict(self.role_switch_count),
+            'total_switches': sum(self.role_switch_count.values()),
+        }
     
     def apply_role_weights(
         self, 
@@ -1360,8 +1905,13 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
         self.mixing_optimizer = optim.Adam(self.mixing_network.parameters(), lr=self.learning_rate)
         
         # 内在好奇心模块 (ICM)
+        # 【新增】传入 alive_time 用于时间衰减（解决嘈杂电视机问题）
         if self.use_icm:
-            self.icm = IntrinsicCuriosityModule(state_dim=64, action_dim=12).to(self.device)
+            self.icm = IntrinsicCuriosityModule(
+                state_dim=64, 
+                action_dim=12,
+                alive_time=self.alive_time  # 传入测试时长
+            ).to(self.device)
             self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=self.learning_rate * 0.5)
         else:
             self.icm = None
@@ -1410,6 +1960,18 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
         # 追踪团队访问的 URL
         self.team_visited_urls: Set[str] = set()
         
+        # 【新增】Action Trace Hash - 解决 Perceptual Aliasing（状态混淆）问题
+        # 论文启发：Dinodroid 提到 GUI 信息建模需要历史信息
+        # 问题：点击"登录"前后 DOM 变化细微，容易产生状态混淆
+        # 解决：将最近 N 步动作序列哈希作为状态的一部分
+        self.ACTION_TRACE_LENGTH = 5  # 追踪最近 5 步动作
+        self.agent_action_traces: Dict[str, List[str]] = {
+            str(i): [] for i in range(self.agent_num)
+        }
+        self.agent_action_trace_hashes: Dict[str, str] = {
+            str(i): "init" for i in range(self.agent_num)
+        }
+        
         # 【新增】存储每个 Agent 的浏览器日志（用于三层奖励系统）
         self.agent_browser_logs: Dict[str, List[Dict]] = {}
         self.agent_performance_logs: Dict[str, List[Dict]] = {}
@@ -1448,6 +2010,98 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
             self.agent_browser_logs[agent_name] = []
             self.agent_performance_logs[agent_name] = []
         return browser_logs, performance_logs
+    
+    # ========== Action Trace Hash 系统 ==========
+    # 解决 Perceptual Aliasing（状态混淆）问题
+    # 论文启发：Dinodroid 提到 GUI 信息建模需要历史信息
+    
+    def update_action_trace(self, agent_name: str, action: WebAction, url: str = None):
+        """
+        更新动作追踪历史
+        
+        这能让 SHAQ 区分出"从 A 页面跳过来"还是"从 B 页面跳过来"
+        彻底解决 Dinodroid 论文中提到的历史依赖问题
+        """
+        # 创建动作签名（包含动作类型和目标）
+        action_sig = self._get_action_signature(action, url)
+        
+        trace = self.agent_action_traces.get(agent_name, [])
+        trace.append(action_sig)
+        
+        # 保留最近 N 步
+        if len(trace) > self.ACTION_TRACE_LENGTH:
+            trace = trace[-self.ACTION_TRACE_LENGTH:]
+        
+        self.agent_action_traces[agent_name] = trace
+        
+        # 计算并缓存哈希
+        trace_str = "->".join(trace)
+        trace_hash = hashlib.md5(trace_str.encode()).hexdigest()[:8]
+        self.agent_action_trace_hashes[agent_name] = trace_hash
+    
+    def _get_action_signature(self, action: WebAction, url: str = None) -> str:
+        """
+        获取动作签名（用于追踪）
+        
+        包含：动作类型 + 目标元素类型 + URL 路径的最后部分
+        """
+        action_type = action.__class__.__name__
+        
+        # 提取目标元素信息
+        target_info = ""
+        if hasattr(action, 'locator') and action.locator:
+            locator = action.locator
+            if hasattr(locator, 'tag'):
+                target_info = locator.tag
+            elif hasattr(locator, 'by'):
+                target_info = str(locator.by)[:10]
+        
+        # 提取 URL 路径的最后部分
+        url_part = ""
+        if url:
+            path = urlparse(url).path
+            parts = [p for p in path.split('/') if p]
+            if parts:
+                url_part = parts[-1][:10]
+        
+        return f"{action_type[:5]}:{target_info[:5]}@{url_part}"
+    
+    def get_action_trace_hash(self, agent_name: str) -> str:
+        """获取 Agent 的当前动作追踪哈希"""
+        return self.agent_action_trace_hashes.get(agent_name, "init")
+    
+    def get_enhanced_state_representation(
+        self, 
+        web_state: WebState, 
+        html: str, 
+        agent_name: str
+    ) -> Dict:
+        """
+        获取增强的状态表示（包含动作历史）
+        
+        返回的字典可用于：
+        1. 状态相似度计算
+        2. 神经网络输入增强
+        3. 调试和分析
+        """
+        # 基础状态特征
+        dom_hash = self.dom_encoder.compute_structure_hash(html) if html else "empty"
+        url = getattr(web_state, 'url', '')
+        
+        # 动作历史特征
+        action_trace_hash = self.get_action_trace_hash(agent_name)
+        action_trace = self.agent_action_traces.get(agent_name, [])
+        
+        return {
+            'dom_hash': dom_hash,
+            'url': url,
+            'action_trace_hash': action_trace_hash,
+            'action_trace': action_trace,
+            # 组合哈希：DOM + URL + 动作历史
+            'combined_hash': hashlib.md5(
+                f"{dom_hash}:{url}:{action_trace_hash}".encode()
+            ).hexdigest()[:12],
+        }
     
     def get_tensor(self, action: WebAction, html: str, web_state: WebState) -> torch.Tensor:
         """将状态-动作对编码为张量"""
@@ -1517,6 +2171,11 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
                 chosen_action = random.choice(actions)
         
         self.action_count[chosen_action] += 1
+        
+        # 【新增】更新动作追踪历史（解决状态混淆问题）
+        url = getattr(web_state, 'url', None)
+        self.update_action_trace(agent_name, chosen_action, url)
+        
         return chosen_action
     
     def update_state_records(self, web_state: WebState, html: str, agent_name: str):
@@ -1594,13 +2253,15 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
         # ============================================================
         if self.reward_system.mode == 'three_tier' and performance_logs:
             # 使用三层奖励系统（论文推荐）
+            # 【新增】传入 agent_name 用于协同增益计算
             total_reward, breakdown = self.reward_system.compute_three_tier_reward(
                 web_state=web_state,
                 html=html,
                 action=prev_action,
                 browser_logs=browser_logs,
                 performance_logs=performance_logs,
-                http_status=http_status
+                http_status=http_status,
+                agent_name=agent_name  # 【新增】
             )
             
             # 日志：显示各层贡献
@@ -1648,12 +2309,18 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
                 self.team_visited_urls.add(current_url)
         
         # ============================================================
-        # Shapley 信用调整（低贡献者获得探索奖励）
+        # 【已修复】移除了原本在此处的 Shapley 信用加分逻辑
+        # 
+        # 原因（理论误区）：
+        #   在 Reward 阶段给低 Shapley 值的 Agent 加探索奖励是"数学有毒"的：
+        #   1. 欺骗 Mixing Network：让网络误以为"划水 Agent 也能获得好收益"
+        #   2. 梯度失效：Agent 因为表现差反而获得奖励，失去改进动力
+        #
+        # 正确做法：
+        #   - Reward（评价）：必须冷酷，没贡献就是 0
+        #   - Epsilon（指导）：低贡献者在 get_action 阶段提高探索率
+        #   （该逻辑已在 get_action 的 shapley_weighted_epsilon 中正确实现）
         # ============================================================
-        shapley_val = self.cached_shapley_values.get(agent_name, 1.0 / self.agent_num)
-        if shapley_val < 1.0 / self.agent_num * 0.8:
-            exploration_bonus = 5.0
-            total_reward += exploration_bonus
         
         return total_reward
     
@@ -1847,11 +2514,20 @@ class SHAQv2(multi_agent.multi_agent_system.MultiAgentSystem):
         mean_shapley = w.grad.mean(dim=0)
         shapley_sum = mean_shapley.abs().sum().item()
         
+        avg_shapley = 1.0 / self.agent_num
+        
         for i in range(self.agent_num):
+            agent_name = str(i)
             if shapley_sum > 0:
-                self.cached_shapley_values[str(i)] = mean_shapley[i].abs().item() / shapley_sum
+                shapley_val = mean_shapley[i].abs().item() / shapley_sum
+                self.cached_shapley_values[agent_name] = shapley_val
             else:
-                self.cached_shapley_values[str(i)] = 1.0 / self.agent_num
+                shapley_val = avg_shapley
+                self.cached_shapley_values[agent_name] = shapley_val
+            
+            # 【新增】更新角色系统的 Shapley 历史（用于动态角色切换）
+            if self.use_role_based:
+                self.role_system.update_shapley_history(agent_name, shapley_val, avg_shapley)
     
     def update_target_networks(self):
         """更新目标网络"""

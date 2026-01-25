@@ -26,17 +26,47 @@ import argparse
 import json
 import logging
 import os
+import random
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import psutil
 
+import numpy as np
 import yaml
+
+
+def set_random_seed(seed: int):
+    """
+    设置所有随机种子以确保可重复性
+    
+    Args:
+        seed: 随机种子值
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 尝试设置 PyTorch 种子（如果可用）
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
+    
+    logger.info(f"随机种子已设置: {seed}")
 
 # 设置日志
 logging.basicConfig(
@@ -77,14 +107,24 @@ class PerformanceMetrics:
     anomaly_count: int = 0                   # 异常卡顿次数
     
     # 学习性能
-    total_reward: float = 0.0
+    # 【修复】区分原始奖励和标准化指标
+    # - total_reward: Agent 内部优化的原始奖励（不同算法可能不可比）
+    # - standardized_novelty_reward: 基于状态新颖度的标准化奖励（用于横向对比）
+    total_reward: float = 0.0              # 原始奖励（Agent 训练目标）
+    total_standardized_reward: float = 0.0 # 标准化奖励（基于新颖度，用于对比）
     avg_reward_per_step: float = 0.0
+    avg_standardized_reward_per_step: float = 0.0
     learning_updates: int = 0
     avg_loss: float = 0.0
+    
+    # 原始奖励曲线（用于绘图）
+    reward_curve: List[float] = field(default_factory=list)
+    standardized_reward_curve: List[float] = field(default_factory=list)
     
     # 状态新颖度（越高越好）
     avg_state_novelty: float = 0.0
     novelty_over_time: List[float] = field(default_factory=list)
+    state_discovery_curve: List[int] = field(default_factory=list)  # 状态发现曲线
     
     # 资源使用
     peak_memory_mb: float = 0.0
@@ -120,6 +160,14 @@ class PerformanceMetrics:
     new_state_rate: float = 0.0         # 新状态发现率 (新状态数/总步数)
     exploration_efficiency: float = 0.0 # 探索效率 (唯一URL/总步数)
     action_diversity: float = 0.0       # 动作多样性 (唯一动作/总动作)
+    
+    # 【新增】效率比指标（ASE 2024 + ARES 思路）
+    # 公式：Efficiency = Unique_API_Endpoints / Total_Steps
+    # 意义：证明 SHAQ 是靠"精准打击"赢的，而不是"暴力破解（随机乱点）"
+    api_efficiency: float = 0.0         # API 效率 = API端点数 / 步数
+    state_efficiency: float = 0.0       # 状态效率 = 状态数 / 步数  
+    url_efficiency: float = 0.0         # URL 效率 = URL数 / 步数
+    reward_efficiency: float = 0.0      # 奖励效率 = 总奖励 / 步数（真正的效率指标）
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -164,6 +212,12 @@ class PerformanceMetrics:
 ║   - 动作多样性: {self.action_diversity:.4f}
 ║   - 状态发现速率: {self.unique_states / max(self.effective_duration_seconds, 1) * 60:.2f} 个/分钟
 ╠══════════════════════════════════════════════════════════════════╣
+║ 【效率比指标】（ASE 2024 / ARES 核心指标）
+║   - 状态效率: {self.state_efficiency:.4f} (状态数/步数)
+║   - URL 效率: {self.url_efficiency:.4f} (URL数/步数)
+║   - 奖励效率: {self.reward_efficiency:.4f} (奖励/步数)
+║   说明: 值越高说明算法越"精准打击"，而非"暴力破解"
+╠══════════════════════════════════════════════════════════════════╣
 ║ 【动作类型分布】
 ║   - 点击: {self.click_actions}  输入: {self.input_actions}  选择: {self.select_actions}
 ╠══════════════════════════════════════════════════════════════════╣
@@ -177,6 +231,129 @@ class PerformanceMetrics:
 ║   - CPU 使用率: {self.cpu_usage_percent:.1f}%
 ╚══════════════════════════════════════════════════════════════════╝
 """
+
+
+@dataclass
+class AggregatedMetrics:
+    """
+    多次运行的聚合指标（mean ± std）
+    用于论文报告中的统计显著性
+    """
+    algorithm: str = ""
+    profile: str = ""
+    num_runs: int = 0
+    seeds: List[int] = field(default_factory=list)
+    
+    # 聚合指标（每个都是 (mean, std) 元组）
+    unique_states: Tuple[float, float] = (0.0, 0.0)
+    unique_actions: Tuple[float, float] = (0.0, 0.0)
+    unique_urls: Tuple[float, float] = (0.0, 0.0)
+    total_steps: Tuple[float, float] = (0.0, 0.0)
+    effective_steps_per_second: Tuple[float, float] = (0.0, 0.0)
+    avg_decision_time_ms: Tuple[float, float] = (0.0, 0.0)
+    total_reward: Tuple[float, float] = (0.0, 0.0)
+    avg_state_novelty: Tuple[float, float] = (0.0, 0.0)
+    new_state_rate: Tuple[float, float] = (0.0, 0.0)
+    anomaly_count: Tuple[float, float] = (0.0, 0.0)
+    peak_memory_mb: Tuple[float, float] = (0.0, 0.0)
+    
+    # 原始数据（用于绘制置信区间）
+    raw_metrics: List[PerformanceMetrics] = field(default_factory=list)
+    
+    @staticmethod
+    def from_runs(runs: List[PerformanceMetrics], seeds: List[int]) -> 'AggregatedMetrics':
+        """从多次运行结果创建聚合指标"""
+        if not runs:
+            return AggregatedMetrics()
+        
+        def calc_mean_std(values: List[float]) -> Tuple[float, float]:
+            if not values:
+                return (0.0, 0.0)
+            mean = np.mean(values)
+            std = np.std(values) if len(values) > 1 else 0.0
+            return (float(mean), float(std))
+        
+        agg = AggregatedMetrics(
+            algorithm=runs[0].algorithm,
+            profile=runs[0].profile,
+            num_runs=len(runs),
+            seeds=seeds,
+            raw_metrics=runs,
+        )
+        
+        # 计算各指标的 mean ± std
+        agg.unique_states = calc_mean_std([r.unique_states for r in runs])
+        agg.unique_actions = calc_mean_std([r.unique_actions for r in runs])
+        agg.unique_urls = calc_mean_std([r.unique_urls for r in runs])
+        agg.total_steps = calc_mean_std([r.total_steps for r in runs])
+        agg.effective_steps_per_second = calc_mean_std([r.effective_steps_per_second for r in runs])
+        agg.avg_decision_time_ms = calc_mean_std([r.avg_decision_time_ms for r in runs])
+        agg.total_reward = calc_mean_std([r.total_reward for r in runs])
+        agg.avg_state_novelty = calc_mean_std([r.avg_state_novelty for r in runs])
+        agg.new_state_rate = calc_mean_std([r.new_state_rate for r in runs])
+        agg.anomaly_count = calc_mean_std([r.anomaly_count for r in runs])
+        agg.peak_memory_mb = calc_mean_std([r.peak_memory_mb for r in runs])
+        
+        return agg
+    
+    def summary(self) -> str:
+        """生成聚合报告（论文格式）"""
+        def fmt(metric: Tuple[float, float], precision: int = 2) -> str:
+            mean, std = metric
+            if std == 0:
+                return f"{mean:.{precision}f}"
+            return f"{mean:.{precision}f} ± {std:.{precision}f}"
+        
+        return f"""
+╔══════════════════════════════════════════════════════════════════╗
+║           聚合性能报告 - {self.algorithm} ({self.num_runs} 次运行)
+╠══════════════════════════════════════════════════════════════════╣
+║ 配置: {self.profile}
+║ 随机种子: {self.seeds}
+╠══════════════════════════════════════════════════════════════════╣
+║ 【覆盖率指标】 (mean ± std)
+║   - 状态覆盖: {fmt(self.unique_states, 1)} 个
+║   - 动作覆盖: {fmt(self.unique_actions, 1)} 个
+║   - URL 覆盖: {fmt(self.unique_urls, 1)} 个
+╠══════════════════════════════════════════════════════════════════╣
+║ 【时间性能】
+║   - 总步数: {fmt(self.total_steps, 0)} 步
+║   - 有效吞吐: {fmt(self.effective_steps_per_second, 3)} 步/秒
+║   - 决策时间: {fmt(self.avg_decision_time_ms)} ms
+╠══════════════════════════════════════════════════════════════════╣
+║ 【学习性能】
+║   - 累计奖励: {fmt(self.total_reward)}
+║   - 平均新颖度: {fmt(self.avg_state_novelty, 4)}
+║   - 新状态率: {fmt(self.new_state_rate, 4)}
+╠══════════════════════════════════════════════════════════════════╣
+║ 【稳定性】
+║   - 异常卡顿: {fmt(self.anomaly_count, 1)} 次
+║   - 峰值内存: {fmt(self.peak_memory_mb, 1)} MB
+╚══════════════════════════════════════════════════════════════════╝
+"""
+    
+    def to_dict(self) -> Dict:
+        """转为字典格式（用于 JSON 保存）"""
+        return {
+            'algorithm': self.algorithm,
+            'profile': self.profile,
+            'num_runs': self.num_runs,
+            'seeds': self.seeds,
+            'metrics': {
+                'unique_states': {'mean': self.unique_states[0], 'std': self.unique_states[1]},
+                'unique_actions': {'mean': self.unique_actions[0], 'std': self.unique_actions[1]},
+                'unique_urls': {'mean': self.unique_urls[0], 'std': self.unique_urls[1]},
+                'total_steps': {'mean': self.total_steps[0], 'std': self.total_steps[1]},
+                'effective_steps_per_second': {'mean': self.effective_steps_per_second[0], 'std': self.effective_steps_per_second[1]},
+                'avg_decision_time_ms': {'mean': self.avg_decision_time_ms[0], 'std': self.avg_decision_time_ms[1]},
+                'total_reward': {'mean': self.total_reward[0], 'std': self.total_reward[1]},
+                'avg_state_novelty': {'mean': self.avg_state_novelty[0], 'std': self.avg_state_novelty[1]},
+                'new_state_rate': {'mean': self.new_state_rate[0], 'std': self.new_state_rate[1]},
+                'anomaly_count': {'mean': self.anomaly_count[0], 'std': self.anomaly_count[1]},
+                'peak_memory_mb': {'mean': self.peak_memory_mb[0], 'std': self.peak_memory_mb[1]},
+            },
+            'raw_runs': [m.to_dict() for m in self.raw_metrics]
+        }
 
 
 class PerformanceMonitor:
@@ -241,9 +418,26 @@ class PerformanceMonitor:
     
     def record_step(self, step_time: float, reward: float, state_hash: int, 
                     action_hash: int, url: str, novelty: float = 0.0,
-                    action_type: str = 'other'):
-        """记录单步执行数据"""
+                    action_type: str = 'other',
+                    standardized_reward: float = None):
+        """
+        记录单步执行数据
+        
+        Args:
+            step_time: 步骤执行时间
+            reward: 原始奖励（Agent 内部优化目标，不同算法可能不可比）
+            state_hash: 状态哈希
+            action_hash: 动作哈希
+            url: 当前 URL
+            novelty: 状态新颖度
+            action_type: 动作类型
+            standardized_reward: 标准化奖励（基于新颖度，用于横向对比）
+        """
         from urllib.parse import urlparse
+        
+        # 如果没有提供标准化奖励，使用基于新颖度的计算
+        if standardized_reward is None:
+            standardized_reward = novelty * 50.0  # 基于新颖度的简单标准化
         
         with self.lock:
             self.step_times.append(step_time * 1000)  # 转换为毫秒
@@ -272,6 +466,11 @@ class PerformanceMonitor:
             self.metrics.total_states_discovered += 1
             self.metrics.total_actions_discovered += 1
             self.metrics.total_urls_visited += 1
+            
+            # 【新增】记录原始奖励和标准化奖励曲线
+            self.metrics.reward_curve.append(reward)
+            self.metrics.standardized_reward_curve.append(standardized_reward)
+            self.metrics.state_discovery_curve.append(len(self.states_set))
             
             # 定期记录时间序列数据
             current_time = time.time()
@@ -381,9 +580,18 @@ class PerformanceMonitor:
                 self.metrics.effective_steps_per_second = self.metrics.total_steps / self.metrics.effective_duration_seconds
             
             # 学习性能
+            # 【修复】分别计算原始奖励和标准化奖励
             self.metrics.total_reward = sum(self.rewards)
             if self.rewards:
                 self.metrics.avg_reward_per_step = self.metrics.total_reward / len(self.rewards)
+            
+            # 计算标准化奖励（从 reward_curve 中提取 standardized 部分）
+            if self.metrics.standardized_reward_curve:
+                self.metrics.total_standardized_reward = sum(self.metrics.standardized_reward_curve)
+                self.metrics.avg_standardized_reward_per_step = (
+                    self.metrics.total_standardized_reward / len(self.metrics.standardized_reward_curve)
+                )
+            
             if self.losses:
                 self.metrics.avg_loss = sum(self.losses) / len(self.losses)
             
@@ -427,6 +635,14 @@ class PerformanceMonitor:
                 self.metrics.new_state_rate = self.metrics.unique_states / self.metrics.total_steps
                 self.metrics.exploration_efficiency = self.metrics.unique_urls / self.metrics.total_steps
                 self.metrics.action_diversity = self.metrics.unique_actions / self.metrics.total_steps
+            
+            # 【新增】效率比指标计算（ASE 2024 / ARES 核心指标）
+            # 公式：Efficiency = Metric / Total_Steps
+            # 意义：证明算法是靠"精准打击"赢的，而非"暴力破解"
+            if self.metrics.total_steps > 0:
+                self.metrics.state_efficiency = self.metrics.unique_states / self.metrics.total_steps
+                self.metrics.url_efficiency = self.metrics.unique_urls / self.metrics.total_steps
+                self.metrics.reward_efficiency = self.metrics.total_reward / self.metrics.total_steps
 
 
 class BenchmarkRunner:
@@ -454,6 +670,8 @@ class BenchmarkRunner:
     def __init__(self, config_path: str = "settings.yaml"):
         self.config_path = config_path
         self.results: Dict[str, PerformanceMetrics] = {}
+        self.aggregated_results: Dict[str, AggregatedMetrics] = {}
+        self._temp_dirs: List[str] = []  # 临时目录列表，用于清理
         
     def resolve_profile_name(self, profile: str) -> str:
         """解析配置名称（支持别名）"""
@@ -514,7 +732,8 @@ class BenchmarkRunner:
             return agent_class or 'Unknown'
     
     def run_benchmark(self, profile: str, duration: int = 300, 
-                      dry_run: bool = False) -> PerformanceMetrics:
+                      dry_run: bool = False, seed: Optional[int] = None,
+                      use_incognito: bool = True) -> PerformanceMetrics:
         """
         运行单个配置的性能测试
         
@@ -522,10 +741,17 @@ class BenchmarkRunner:
             profile: 配置名称（支持别名）
             duration: 测试时长（秒）
             dry_run: 是否干跑（不实际启动浏览器）
+            seed: 随机种子（None 表示使用当前时间）
+            use_incognito: 是否使用隐身模式（确保浏览器环境干净）
         """
+        # 设置随机种子
+        if seed is None:
+            seed = int(time.time()) % 100000
+        set_random_seed(seed)
+        
         # 解析别名
         resolved_profile = self.resolve_profile_name(profile)
-        logger.info(f"开始性能测试: {resolved_profile}, 时长: {duration}秒")
+        logger.info(f"开始性能测试: {resolved_profile}, 时长: {duration}秒, 种子: {seed}, 隐身模式: {use_incognito}")
         
         config = self.load_config(profile)
         algorithm = self.get_algorithm_name(config)
@@ -542,7 +768,7 @@ class BenchmarkRunner:
             # 实际运行
             monitor.start()
             try:
-                self._actual_run(resolved_profile, config, monitor, duration)
+                self._actual_run(resolved_profile, config, monitor, duration, use_incognito)
             except Exception as e:
                 logger.error(f"测试过程中出错: {e}")
                 traceback.print_exc()
@@ -551,6 +777,79 @@ class BenchmarkRunner:
         
         self.results[resolved_profile] = monitor.metrics
         return monitor.metrics
+    
+    def run_multiple(self, profile: str, duration: int = 300, 
+                     num_runs: int = 3, seeds: Optional[List[int]] = None,
+                     use_incognito: bool = True, dry_run: bool = False) -> AggregatedMetrics:
+        """
+        多次运行同一配置的性能测试，并计算统计聚合结果
+        
+        用于论文报告：确保结果的统计显著性
+        
+        Args:
+            profile: 配置名称（支持别名）
+            duration: 每次测试时长（秒）
+            num_runs: 运行次数（建议 3-5 次）
+            seeds: 随机种子列表（None 表示自动生成）
+            use_incognito: 是否使用隐身模式
+            dry_run: 是否干跑
+            
+        Returns:
+            AggregatedMetrics: 包含 mean ± std 的聚合结果
+        """
+        resolved_profile = self.resolve_profile_name(profile)
+        
+        # 生成随机种子
+        if seeds is None:
+            base_seed = int(time.time()) % 10000
+            seeds = [base_seed + i * 1000 for i in range(num_runs)]
+        elif len(seeds) < num_runs:
+            # 补充种子
+            seeds = seeds + [seeds[-1] + i * 1000 for i in range(1, num_runs - len(seeds) + 1)]
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"开始多次运行测试: {resolved_profile}")
+        logger.info(f"运行次数: {num_runs}, 每次时长: {duration}秒")
+        logger.info(f"随机种子: {seeds[:num_runs]}")
+        logger.info(f"{'='*60}")
+        
+        runs: List[PerformanceMetrics] = []
+        
+        for i, seed in enumerate(seeds[:num_runs]):
+            logger.info(f"\n--- 第 {i+1}/{num_runs} 次运行 (seed={seed}) ---")
+            
+            # 每次运行使用不同的结果键，避免覆盖
+            run_key = f"{resolved_profile}_run{i+1}"
+            
+            try:
+                metrics = self.run_benchmark(
+                    profile=profile,
+                    duration=duration,
+                    dry_run=dry_run,
+                    seed=seed,
+                    use_incognito=use_incognito
+                )
+                runs.append(metrics)
+                logger.info(f"第 {i+1} 次运行完成: 步数={metrics.total_steps}, 状态={metrics.unique_states}")
+                
+                # 运行之间暂停，让系统资源恢复
+                if i < num_runs - 1:
+                    logger.info("等待 10 秒后开始下一次运行...")
+                    time.sleep(10)
+                    
+            except Exception as e:
+                logger.error(f"第 {i+1} 次运行失败: {e}")
+                traceback.print_exc()
+        
+        # 计算聚合统计
+        if runs:
+            aggregated = AggregatedMetrics.from_runs(runs, seeds[:len(runs)])
+            self.aggregated_results[resolved_profile] = aggregated
+            logger.info(f"\n多次运行测试完成，成功 {len(runs)}/{num_runs} 次")
+            return aggregated
+        else:
+            logger.error("所有运行都失败了")
+            return AggregatedMetrics()
     
     def _simulate_run(self, monitor: PerformanceMonitor, duration: int):
         """模拟运行（用于测试监控系统）"""
@@ -583,8 +882,17 @@ class BenchmarkRunner:
         logger.info(f"模拟运行完成: {step} 步")
     
     def _actual_run(self, profile: str, config: Dict, monitor: PerformanceMonitor, 
-                    duration: int):
-        """实际运行测试"""
+                    duration: int, use_incognito: bool = True):
+        """
+        实际运行测试
+        
+        Args:
+            profile: 配置名称
+            config: 配置字典
+            monitor: 性能监控器
+            duration: 测试时长
+            use_incognito: 是否使用隐身模式（确保浏览器环境干净）
+        """
         import sys
         import importlib
         from selenium.webdriver.chrome.options import Options
@@ -592,6 +900,13 @@ class BenchmarkRunner:
         # 临时修改 sys.argv 以避免与 cli_options 的参数解析冲突
         original_argv = sys.argv.copy()
         sys.argv = [sys.argv[0], '--profile', profile]
+        
+        # 创建临时数据目录（确保每次测试都是干净的环境）
+        temp_data_dir = None
+        if use_incognito:
+            temp_data_dir = tempfile.mkdtemp(prefix='benchmark_chrome_')
+            self._temp_dirs.append(temp_data_dir)
+            logger.info(f"创建临时浏览器数据目录: {temp_data_dir}")
         
         try:
             # 完全清除相关模块缓存，然后重新导入
@@ -633,6 +948,16 @@ class BenchmarkRunner:
                 chrome_options.add_argument(arg)
             chrome_options.binary_location = settings.browser_path
             
+            # 添加隐身模式和干净环境的参数
+            if use_incognito:
+                chrome_options.add_argument('--incognito')
+                chrome_options.add_argument(f'--user-data-dir={temp_data_dir}')
+                chrome_options.add_argument('--disable-extensions')
+                chrome_options.add_argument('--disable-plugins')
+                chrome_options.add_argument('--disable-application-cache')
+                chrome_options.add_argument('--disable-cache')
+                logger.info("已启用隐身模式和干净浏览器环境")
+            
             # 创建测试实例
             webtest = WebtestMultiAgent(chrome_options)
             
@@ -659,7 +984,19 @@ class BenchmarkRunner:
                     action = original_get_action(web_state, html, agent_name, url, check_result)
                     step_time = time.time() - step_start
                     
-                    # 计算新颖度
+                    # ============================================================
+                    # 【修复】分离原始奖励和标准化奖励
+                    # 
+                    # 问题：之前的代码为了"公平比较"覆盖了原始奖励
+                    # 后果：相当于"让学生复习数学（ELOC），考试却考英语（URL）"
+                    #       SHAQ 可能在 API/DOM 层面大杀四方，但 Benchmark 看不到
+                    # 
+                    # 修复：
+                    # 1. reward: 始终使用 Agent 原始的 get_reward（训练目标）
+                    # 2. standardized_reward: 基于新颖度的标准化奖励（用于横向对比）
+                    # ============================================================
+                    
+                    # 计算新颖度（用于标准化奖励）
                     novelty = 0.0
                     state_dict = webtest.multi_agent_system.state_dict
                     if hasattr(web_state, 'similarity') and len(state_dict) > 1:
@@ -669,58 +1006,48 @@ class BenchmarkRunner:
                         )
                         novelty = 1 - max_sim
                     
-                    # 获取奖励 - 使用统一的基于状态新颖度的奖励计算
-                    # 这样可以公平比较不同算法的探索效率
+                    # 计算标准化奖励（用于横向对比）
+                    from state.impl.action_set_with_execution_times_state import ActionSetWithExecutionTimesState
+                    R_A_BASE_HIGH = 50.0
+                    R_A_BASE_MIDDLE = 10.0
+                    R_A_MIN_SIM_LINE = 0.7
+                    R_A_MIDDLE_SIM_LINE = 0.85
+                    
+                    standardized_reward = 0.0
+                    if isinstance(web_state, ActionSetWithExecutionTimesState):
+                        max_sim = -1.0
+                        for temp_state in state_dict.keys():
+                            if web_state == temp_state:
+                                continue
+                            if hasattr(web_state, 'similarity'):
+                                sim = web_state.similarity(temp_state)
+                                if sim > max_sim:
+                                    max_sim = sim
+                        
+                        if max_sim < R_A_MIN_SIM_LINE:
+                            standardized_reward = R_A_BASE_HIGH
+                        elif max_sim < R_A_MIDDLE_SIM_LINE:
+                            standardized_reward = R_A_BASE_MIDDLE
+                        else:
+                            visited_time = state_dict.get(web_state, 0)
+                            standardized_reward = 2.0 / max(1, visited_time)
+                    
+                    # 获取原始奖励（Agent 训练目标）
                     reward = 0.0
-                    algo_class = webtest.multi_agent_system.__class__.__name__
                     try:
-                        if algo_class == 'Marg':
-                            # Marg 原生使用基于动作执行次数的奖励，为了公平比较
-                            # 这里使用与 SHAQ/MargD 相同的基于状态新颖度的奖励计算
-                            from state.impl.action_set_with_execution_times_state import ActionSetWithExecutionTimesState
-                            R_A_BASE_HIGH = 50.0
-                            R_A_BASE_MIDDLE = 10.0
-                            R_A_MIN_SIM_LINE = 0.7
-                            R_A_MIDDLE_SIM_LINE = 0.85
-                            
-                            if isinstance(web_state, ActionSetWithExecutionTimesState):
-                                # 计算与已知状态的最大相似度
-                                max_sim = -1.0
-                                state_dict = webtest.multi_agent_system.state_dict
-                                for temp_state in state_dict.keys():
-                                    if web_state == temp_state:
-                                        continue
-                                    if hasattr(web_state, 'similarity'):
-                                        sim = web_state.similarity(temp_state)
-                                        if sim > max_sim:
-                                            max_sim = sim
-                                
-                                # 基于新颖度的奖励（与 SHAQ/MargD 相同）
-                                if max_sim < R_A_MIN_SIM_LINE:
-                                    reward = R_A_BASE_HIGH  # 50 分
-                                elif max_sim < R_A_MIDDLE_SIM_LINE:
-                                    reward = R_A_BASE_MIDDLE  # 10 分
-                                else:
-                                    # 重复访问的状态，奖励递减
-                                    visited_time = state_dict.get(web_state, 0)
-                                    if visited_time == 0:
-                                        reward = 2.0
-                                    else:
-                                        reward = 2.0 / float(visited_time)
-                        elif hasattr(webtest.multi_agent_system, 'get_reward'):
-                            # SHAQ/MargD 风格的调用
+                        if hasattr(webtest.multi_agent_system, 'get_reward'):
                             import inspect
                             sig = inspect.signature(webtest.multi_agent_system.get_reward)
                             param_count = len(sig.parameters)
                             if param_count >= 3:
-                                # SHAQv2 风格: get_reward(web_state, html, agent_name)
                                 reward = webtest.multi_agent_system.get_reward(web_state, html, agent_name)
                             else:
-                                # SHAQ/MargD 风格: get_reward(web_state, agent_name)
                                 reward = webtest.multi_agent_system.get_reward(web_state, agent_name)
+                        else:
+                            # 对于没有 get_reward 的算法（如 Marg），使用标准化奖励
+                            reward = standardized_reward
                     except Exception as e:
-                        # 如果有任何错误，记录但不中断
-                        pass
+                        reward = standardized_reward  # 回退到标准化奖励
                     
                     # 识别动作类型
                     action_type = 'other'
@@ -739,7 +1066,8 @@ class BenchmarkRunner:
                         action_hash=hash(str(action)),
                         url=url,
                         novelty=novelty,
-                        action_type=action_type
+                        action_type=action_type,
+                        standardized_reward=standardized_reward
                     )
                     
                     return action
@@ -786,9 +1114,30 @@ class BenchmarkRunner:
         finally:
             # 恢复原始 argv
             sys.argv = original_argv
+            
+            # 清理临时目录
+            if temp_data_dir and os.path.exists(temp_data_dir):
+                try:
+                    shutil.rmtree(temp_data_dir)
+                    self._temp_dirs.remove(temp_data_dir)
+                    logger.info(f"已清理临时目录: {temp_data_dir}")
+                except Exception as e:
+                    logger.warning(f"清理临时目录失败: {e}")
+    
+    def cleanup_temp_dirs(self):
+        """清理所有临时目录"""
+        for temp_dir in self._temp_dirs[:]:
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    self._temp_dirs.remove(temp_dir)
+                    logger.info(f"已清理临时目录: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"清理临时目录失败: {e}")
     
     def compare_profiles(self, profiles: List[str], duration: int = 300,
-                        dry_run: bool = False) -> Dict[str, PerformanceMetrics]:
+                        dry_run: bool = False, use_incognito: bool = True,
+                        seed: Optional[int] = None) -> Dict[str, PerformanceMetrics]:
         """
         对比多个配置的性能
         
@@ -796,6 +1145,8 @@ class BenchmarkRunner:
             profiles: 配置名称列表
             duration: 每个配置的测试时长
             dry_run: 是否干跑
+            use_incognito: 是否使用隐身模式
+            seed: 随机种子（所有配置使用相同种子以确保公平）
         """
         # 预加载 Word2Vec 模型，避免在第一个算法测试时花费 45 秒加载
         # 这样可以确保所有算法的测试时间都是公平的
@@ -816,12 +1167,59 @@ class BenchmarkRunner:
             logger.info(f"{'='*60}")
             
             try:
-                self.run_benchmark(profile, duration, dry_run)
+                self.run_benchmark(profile, duration, dry_run, seed=seed, use_incognito=use_incognito)
             except Exception as e:
                 logger.error(f"配置 {profile} 测试失败: {e}")
                 traceback.print_exc()
         
         return self.results
+    
+    def compare_profiles_multi_run(self, profiles: List[str], duration: int = 300,
+                                   num_runs: int = 3, use_incognito: bool = True,
+                                   seeds: Optional[List[int]] = None,
+                                   dry_run: bool = False) -> Dict[str, AggregatedMetrics]:
+        """
+        对比多个配置的性能（多次运行版本，用于论文）
+        
+        Args:
+            profiles: 配置名称列表
+            duration: 每次测试时长
+            num_runs: 每个配置运行次数
+            use_incognito: 是否使用隐身模式
+            seeds: 随机种子列表（所有配置使用相同种子序列）
+            dry_run: 是否干跑
+        """
+        # 预加载 Word2Vec 模型
+        if not dry_run:
+            try:
+                logger.info("预加载 Word2Vec 模型（避免影响测试时间）...")
+                from transformer.utils.word2vec_cache import preload_word2vec_model, get_cache_info
+                preload_word2vec_model()
+                cache_info = get_cache_info()
+                logger.info(f"Word2Vec 模型已缓存: 加载时间 {cache_info['load_time']:.1f}s, "
+                           f"词汇量 {cache_info['vocab_size']}")
+            except Exception as e:
+                logger.warning(f"预加载 Word2Vec 模型失败（非致命错误）: {e}")
+        
+        for profile in profiles:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"测试配置: {profile} ({num_runs} 次运行)")
+            logger.info(f"{'='*60}")
+            
+            try:
+                self.run_multiple(
+                    profile=profile,
+                    duration=duration,
+                    num_runs=num_runs,
+                    seeds=seeds,
+                    use_incognito=use_incognito,
+                    dry_run=dry_run
+                )
+            except Exception as e:
+                logger.error(f"配置 {profile} 测试失败: {e}")
+                traceback.print_exc()
+        
+        return self.aggregated_results
     
     def generate_comparison_report(self) -> str:
         """生成对比报告"""
@@ -857,6 +1255,10 @@ class BenchmarkRunner:
             ("新状态率", "new_state_rate", "", True),
             ("探索效率", "exploration_efficiency", "", True),
             ("动作多样性", "action_diversity", "", True),
+            # 【新增】效率比指标（ASE 2024 核心）
+            ("状态效率", "state_efficiency", "", True),  # 状态数/步数
+            ("URL效率", "url_efficiency", "", True),    # URL数/步数
+            ("奖励效率", "reward_efficiency", "", True), # 奖励/步数（关键！）
             # 动作类型分布
             ("点击动作", "click_actions", "次", True),
             ("输入动作", "input_actions", "次", True),
@@ -974,6 +1376,489 @@ class BenchmarkRunner:
         logger.info(f"结果已保存到: {output_path}")
 
 
+class BenchmarkVisualizer:
+    """
+    Benchmark 结果可视化工具
+    
+    生成论文级图表：
+    1. Cumulative Reward 曲线（带置信区间阴影）
+    2. Unique States 发现曲线
+    3. Step Times 计算开销对比
+    4. 综合雷达图
+    """
+    
+    # 论文风格配色（区分度高，打印友好）
+    COLORS = {
+        'SHAQ': '#1f77b4',      # 蓝色
+        'SHAQv2': '#2ca02c',    # 绿色
+        'QTRAN': '#ff7f0e',     # 橙色
+        'QMIX': '#d62728',      # 红色
+        'Marg-DQL': '#9467bd',  # 紫色
+        'IQL': '#8c564b',       # 棕色
+        'VDN': '#e377c2',       # 粉色
+        'default': '#7f7f7f',   # 灰色
+    }
+    
+    def __init__(self, output_dir: str = './benchmark_figures'):
+        """
+        初始化可视化器
+        
+        Args:
+            output_dir: 图表输出目录
+        """
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 尝试导入 matplotlib
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # 非交互式后端，适合服务器
+            import matplotlib.pyplot as plt
+            self.plt = plt
+            self.matplotlib = matplotlib
+            
+            # 设置论文风格
+            plt.style.use('seaborn-v0_8-whitegrid')
+            plt.rcParams.update({
+                'font.size': 12,
+                'axes.labelsize': 14,
+                'axes.titlesize': 16,
+                'legend.fontsize': 11,
+                'xtick.labelsize': 11,
+                'ytick.labelsize': 11,
+                'figure.figsize': (10, 6),
+                'figure.dpi': 150,
+                'savefig.dpi': 300,
+                'savefig.bbox': 'tight',
+            })
+            self.available = True
+            logger.info("Matplotlib 可视化模块已加载")
+        except ImportError as e:
+            logger.warning(f"Matplotlib 不可用，跳过可视化: {e}")
+            self.available = False
+    
+    def get_color(self, algorithm: str) -> str:
+        """获取算法对应的颜色"""
+        for key, color in self.COLORS.items():
+            if key.lower() in algorithm.lower():
+                return color
+        return self.COLORS['default']
+    
+    def load_results(self, json_path: str) -> Dict:
+        """加载 benchmark 结果 JSON 文件"""
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    def plot_comparison(self, json_path: str, show: bool = False):
+        """
+        生成完整的对比图表集
+        
+        Args:
+            json_path: benchmark 结果 JSON 文件路径
+            show: 是否显示图表（交互模式）
+        """
+        if not self.available:
+            logger.warning("Matplotlib 不可用，跳过绘图")
+            return
+        
+        data = self.load_results(json_path)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # 检查是否有聚合结果（多次运行）
+        has_aggregated = bool(data.get('aggregated_results'))
+        has_single = bool(data.get('single_run_results') or data.get('results'))
+        
+        single_results = data.get('single_run_results') or data.get('results', {})
+        agg_results = data.get('aggregated_results', {})
+        
+        if has_single and single_results:
+            # 1. 累积奖励曲线
+            self._plot_cumulative_reward(single_results, timestamp)
+            
+            # 2. 状态发现曲线
+            self._plot_state_discovery(single_results, timestamp)
+            
+            # 3. 计算时间对比
+            self._plot_step_times(single_results, timestamp)
+            
+            # 4. 综合对比柱状图
+            self._plot_summary_bars(single_results, timestamp)
+        
+        if has_aggregated and agg_results:
+            # 5. 多次运行的置信区间图
+            self._plot_aggregated_comparison(agg_results, timestamp)
+        
+        # 6. 生成综合面板图
+        if single_results:
+            self._plot_combined_panel(single_results, timestamp)
+        
+        logger.info(f"图表已保存到: {self.output_dir}")
+        
+        if show and self.available:
+            self.plt.show()
+    
+    def _plot_cumulative_reward(self, results: Dict, timestamp: str):
+        """绘制累积奖励曲线"""
+        plt = self.plt
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        for profile, metrics in results.items():
+            algo = metrics.get('algorithm', profile)
+            color = self.get_color(algo)
+            
+            # 从时间序列数据绘制
+            reward_curve = metrics.get('reward_curve', [])
+            timestamps_data = metrics.get('timestamps', [])
+            
+            if reward_curve and timestamps_data:
+                # 将时间戳转换为相对时间（分钟）
+                if timestamps_data:
+                    start_time = timestamps_data[0]
+                    times_min = [(t - start_time) / 60 for t in timestamps_data[:len(reward_curve)]]
+                else:
+                    times_min = list(range(len(reward_curve)))
+                
+                # 计算累积奖励
+                cumulative = np.cumsum(reward_curve)
+                ax.plot(times_min, cumulative, label=algo, color=color, linewidth=2)
+            else:
+                # 如果没有时间序列数据，用总奖励画一个点
+                total_reward = metrics.get('total_reward', 0)
+                duration = metrics.get('duration_seconds', 0) / 60
+                ax.scatter([duration], [total_reward], label=f"{algo} (总计)", 
+                          color=color, s=100, marker='o')
+        
+        ax.set_xlabel('时间 (分钟)')
+        ax.set_ylabel('累积奖励')
+        ax.set_title('累积奖励曲线对比')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        fig.savefig(f'{self.output_dir}/cumulative_reward_{timestamp}.png')
+        plt.close(fig)
+        logger.info(f"已生成: cumulative_reward_{timestamp}.png")
+    
+    def _plot_state_discovery(self, results: Dict, timestamp: str):
+        """绘制状态发现曲线"""
+        plt = self.plt
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        for profile, metrics in results.items():
+            algo = metrics.get('algorithm', profile)
+            color = self.get_color(algo)
+            
+            state_curve = metrics.get('state_discovery_curve', [])
+            timestamps_data = metrics.get('timestamps', [])
+            
+            if state_curve and timestamps_data:
+                start_time = timestamps_data[0]
+                times_min = [(t - start_time) / 60 for t in timestamps_data[:len(state_curve)]]
+                ax.plot(times_min, state_curve, label=algo, color=color, linewidth=2)
+            else:
+                # 用最终值画点
+                unique_states = metrics.get('unique_states', 0)
+                duration = metrics.get('duration_seconds', 0) / 60
+                ax.scatter([duration], [unique_states], label=f"{algo} (最终)", 
+                          color=color, s=100, marker='s')
+        
+        ax.set_xlabel('时间 (分钟)')
+        ax.set_ylabel('发现的唯一状态数')
+        ax.set_title('状态发现效率对比')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        fig.savefig(f'{self.output_dir}/state_discovery_{timestamp}.png')
+        plt.close(fig)
+        logger.info(f"已生成: state_discovery_{timestamp}.png")
+    
+    def _plot_step_times(self, results: Dict, timestamp: str):
+        """绘制计算时间对比（关键：评估 Lovasz Extension 的计算代价）"""
+        plt = self.plt
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+        algorithms = []
+        decision_times = []
+        step_durations = []
+        colors = []
+        
+        for profile, metrics in results.items():
+            algo = metrics.get('algorithm', profile)
+            algorithms.append(algo)
+            decision_times.append(metrics.get('avg_decision_time_ms', 0))
+            step_durations.append(metrics.get('effective_step_duration_ms', 0))
+            colors.append(self.get_color(algo))
+        
+        # 左图：算法决策时间（关键指标）
+        bars1 = ax1.bar(algorithms, decision_times, color=colors, alpha=0.8)
+        ax1.set_xlabel('算法')
+        ax1.set_ylabel('平均决策时间 (ms)')
+        ax1.set_title('算法决策时间对比\n(神经网络推理 + Shapley/Mixing计算)')
+        ax1.tick_params(axis='x', rotation=15)
+        
+        # 添加数值标签
+        for bar, val in zip(bars1, decision_times):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=10)
+        
+        # 右图：端到端步时间
+        bars2 = ax2.bar(algorithms, step_durations, color=colors, alpha=0.8)
+        ax2.set_xlabel('算法')
+        ax2.set_ylabel('平均步时间 (ms)')
+        ax2.set_title('端到端步时间对比\n(包含浏览器渲染/网络延迟)')
+        ax2.tick_params(axis='x', rotation=15)
+        
+        for bar, val in zip(bars2, step_durations):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50,
+                    f'{val:.0f}', ha='center', va='bottom', fontsize=10)
+        
+        plt.tight_layout()
+        fig.savefig(f'{self.output_dir}/step_times_{timestamp}.png')
+        plt.close(fig)
+        logger.info(f"已生成: step_times_{timestamp}.png")
+    
+    def _plot_summary_bars(self, results: Dict, timestamp: str):
+        """绘制综合对比柱状图"""
+        plt = self.plt
+        
+        metrics_to_plot = [
+            ('unique_states', '状态覆盖', '个'),
+            ('unique_urls', 'URL 覆盖', '个'),
+            ('total_steps', '总步数', '步'),
+            ('effective_steps_per_second', '有效吞吐', '步/秒'),
+        ]
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        axes = axes.flatten()
+        
+        algorithms = list(results.keys())
+        algo_names = [results[p].get('algorithm', p) for p in algorithms]
+        colors = [self.get_color(name) for name in algo_names]
+        
+        for idx, (metric_key, title, unit) in enumerate(metrics_to_plot):
+            ax = axes[idx]
+            values = [results[p].get(metric_key, 0) for p in algorithms]
+            
+            bars = ax.bar(algo_names, values, color=colors, alpha=0.8)
+            ax.set_title(title)
+            ax.set_ylabel(f'{title} ({unit})')
+            ax.tick_params(axis='x', rotation=15)
+            
+            # 标记最佳值
+            if values:
+                max_idx = values.index(max(values))
+                bars[max_idx].set_edgecolor('gold')
+                bars[max_idx].set_linewidth(3)
+        
+        plt.tight_layout()
+        fig.savefig(f'{self.output_dir}/summary_comparison_{timestamp}.png')
+        plt.close(fig)
+        logger.info(f"已生成: summary_comparison_{timestamp}.png")
+    
+    def _plot_aggregated_comparison(self, agg_results: Dict, timestamp: str):
+        """绘制多次运行的聚合对比图（带置信区间）"""
+        plt = self.plt
+        
+        metrics_to_plot = [
+            ('unique_states', '状态覆盖'),
+            ('total_steps', '总步数'),
+            ('avg_decision_time_ms', '决策时间 (ms)'),
+            ('total_reward', '累积奖励'),
+        ]
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        axes = axes.flatten()
+        
+        algorithms = list(agg_results.keys())
+        algo_names = [agg_results[p].get('algorithm', p) for p in algorithms]
+        colors = [self.get_color(name) for name in algo_names]
+        x_pos = np.arange(len(algorithms))
+        
+        for idx, (metric_key, title) in enumerate(metrics_to_plot):
+            ax = axes[idx]
+            
+            means = []
+            stds = []
+            for p in algorithms:
+                metric_data = agg_results[p].get('metrics', {}).get(metric_key, {})
+                means.append(metric_data.get('mean', 0))
+                stds.append(metric_data.get('std', 0))
+            
+            # 绘制带误差棒的柱状图
+            bars = ax.bar(x_pos, means, yerr=stds, capsize=5,
+                         color=colors, alpha=0.8, ecolor='black')
+            
+            ax.set_title(f'{title}\n(mean ± std, n={agg_results[algorithms[0]].get("num_runs", "?")})')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(algo_names, rotation=15)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            # 添加数值标签
+            for i, (bar, mean, std) in enumerate(zip(bars, means, stds)):
+                label = f'{mean:.1f}±{std:.1f}' if std > 0 else f'{mean:.1f}'
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.5,
+                       label, ha='center', va='bottom', fontsize=9)
+        
+        plt.tight_layout()
+        fig.savefig(f'{self.output_dir}/aggregated_comparison_{timestamp}.png')
+        plt.close(fig)
+        logger.info(f"已生成: aggregated_comparison_{timestamp}.png (论文级，带置信区间)")
+    
+    def _plot_combined_panel(self, results: Dict, timestamp: str):
+        """生成综合面板图（适合论文单图展示）"""
+        plt = self.plt
+        
+        fig = plt.figure(figsize=(16, 12))
+        
+        # 创建 2x2 的子图布局
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25)
+        
+        algorithms = list(results.keys())
+        algo_names = [results[p].get('algorithm', p) for p in algorithms]
+        colors = [self.get_color(name) for name in algo_names]
+        
+        # 1. 左上：累积奖励曲线
+        ax1 = fig.add_subplot(gs[0, 0])
+        for i, (profile, metrics) in enumerate(results.items()):
+            algo = metrics.get('algorithm', profile)
+            reward_curve = metrics.get('reward_curve', [])
+            if reward_curve:
+                cumulative = np.cumsum(reward_curve)
+                ax1.plot(cumulative, label=algo, color=colors[i], linewidth=2)
+        ax1.set_xlabel('Steps')
+        ax1.set_ylabel('Cumulative Reward')
+        ax1.set_title('(a) Cumulative Reward')
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 右上：状态发现曲线
+        ax2 = fig.add_subplot(gs[0, 1])
+        for i, (profile, metrics) in enumerate(results.items()):
+            algo = metrics.get('algorithm', profile)
+            state_curve = metrics.get('state_discovery_curve', [])
+            if state_curve:
+                ax2.plot(state_curve, label=algo, color=colors[i], linewidth=2)
+        ax2.set_xlabel('Steps')
+        ax2.set_ylabel('Unique States')
+        ax2.set_title('(b) State Discovery')
+        ax2.legend(loc='upper left')
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 左下：决策时间对比
+        ax3 = fig.add_subplot(gs[1, 0])
+        decision_times = [results[p].get('avg_decision_time_ms', 0) for p in algorithms]
+        bars = ax3.bar(algo_names, decision_times, color=colors, alpha=0.8)
+        ax3.set_ylabel('Decision Time (ms)')
+        ax3.set_title('(c) Computational Cost')
+        ax3.tick_params(axis='x', rotation=15)
+        for bar, val in zip(bars, decision_times):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2,
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=10)
+        
+        # 4. 右下：综合性能雷达图
+        ax4 = fig.add_subplot(gs[1, 1], projection='polar')
+        
+        # 雷达图的维度
+        categories = ['States', 'URLs', 'Steps', 'Throughput', 'Stability']
+        N = len(categories)
+        angles = [n / float(N) * 2 * np.pi for n in range(N)]
+        angles += angles[:1]  # 闭合
+        
+        for i, (profile, metrics) in enumerate(results.items()):
+            algo = metrics.get('algorithm', profile)
+            
+            # 归一化各指标到 0-1
+            values = [
+                min(1, metrics.get('unique_states', 0) / 100),
+                min(1, metrics.get('unique_urls', 0) / 50),
+                min(1, metrics.get('total_steps', 0) / 1000),
+                min(1, metrics.get('effective_steps_per_second', 0) / 0.5),
+                max(0, 1 - metrics.get('anomaly_count', 0) / 5),
+            ]
+            values += values[:1]  # 闭合
+            
+            ax4.plot(angles, values, 'o-', linewidth=2, label=algo, color=colors[i])
+            ax4.fill(angles, values, alpha=0.15, color=colors[i])
+        
+        ax4.set_xticks(angles[:-1])
+        ax4.set_xticklabels(categories)
+        ax4.set_title('(d) Overall Performance')
+        ax4.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
+        
+        plt.suptitle('Multi-Agent Algorithm Performance Comparison', fontsize=16, y=1.02)
+        fig.savefig(f'{self.output_dir}/combined_panel_{timestamp}.png', 
+                   bbox_inches='tight', pad_inches=0.2)
+        plt.close(fig)
+        logger.info(f"已生成: combined_panel_{timestamp}.png (论文级综合面板)")
+    
+    def plot_reward_with_confidence(self, agg_results: Dict, timestamp: str = None):
+        """
+        绘制带置信区间阴影的奖励曲线（论文核心图）
+        
+        这是验证"信度分配"效果的关键图表：
+        - SHAQ 的曲线上升趋势应该更陡峭
+        - 阴影（std）越窄，说明 Lovasz Extension 让协同更稳定
+        """
+        if not self.available:
+            return
+        
+        plt = self.plt
+        timestamp = timestamp or datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        fig, ax = plt.subplots(figsize=(12, 7))
+        
+        for profile, agg in agg_results.items():
+            algo = agg.get('algorithm', profile)
+            color = self.get_color(algo)
+            
+            raw_runs = agg.get('raw_runs', [])
+            if not raw_runs:
+                continue
+            
+            # 收集所有运行的奖励曲线
+            all_reward_curves = []
+            max_len = 0
+            for run in raw_runs:
+                curve = run.get('reward_curve', [])
+                if curve:
+                    all_reward_curves.append(np.cumsum(curve))
+                    max_len = max(max_len, len(curve))
+            
+            if not all_reward_curves:
+                continue
+            
+            # 对齐长度（用最后一个值填充）
+            aligned_curves = []
+            for curve in all_reward_curves:
+                if len(curve) < max_len:
+                    padding = np.full(max_len - len(curve), curve[-1])
+                    curve = np.concatenate([curve, padding])
+                aligned_curves.append(curve[:max_len])
+            
+            # 计算均值和标准差
+            curves_array = np.array(aligned_curves)
+            mean_curve = np.mean(curves_array, axis=0)
+            std_curve = np.std(curves_array, axis=0)
+            
+            x = np.arange(len(mean_curve))
+            
+            # 绘制均值曲线
+            ax.plot(x, mean_curve, label=algo, color=color, linewidth=2)
+            
+            # 绘制置信区间阴影
+            ax.fill_between(x, mean_curve - std_curve, mean_curve + std_curve,
+                           color=color, alpha=0.2)
+        
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Cumulative Reward')
+        ax.set_title('Cumulative Reward with Confidence Interval\n(Shaded area = ±1 std)')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        fig.savefig(f'{self.output_dir}/reward_confidence_{timestamp}.png')
+        plt.close(fig)
+        logger.info(f"已生成: reward_confidence_{timestamp}.png (带置信区间)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="多智能体强化学习算法性能对比测试",
@@ -981,13 +1866,22 @@ def main():
         epilog="""
 示例:
   # 测试单个配置
-  python benchmark.py --profile github-marl-3h-shaq-5agent --duration 300
+  python benchmark.py --profile shaq --duration 300
   
-  # 对比多个配置
-  python benchmark.py --compare github-marl-3h-shaq-5agent,github-marl-3h-marg-dql-5agent
+  # 对比多个配置（单次运行）
+  python benchmark.py --compare shaq,qtran --duration 1800
+  
+  # 论文级对比：多次运行 + 统计汇总
+  python benchmark.py --compare shaq,qtran --duration 1800 --num-runs 3
+  
+  # 指定随机种子（可复现）
+  python benchmark.py --profile shaq --duration 300 --seed 42
   
   # 干跑测试（不启动浏览器）
-  python benchmark.py --profile quick-test-shaq --duration 60 --dry-run
+  python benchmark.py --profile shaq --duration 60 --dry-run
+  
+  # 禁用隐身模式（不推荐，可能导致缓存影响）
+  python benchmark.py --profile shaq --no-incognito
   
   # 列出所有可用配置
   python benchmark.py --list-profiles
@@ -1001,6 +1895,24 @@ def main():
     parser.add_argument('--output', type=str, default='benchmark_results.json', help='输出文件路径')
     parser.add_argument('--list-profiles', action='store_true', help='列出所有可用配置')
     parser.add_argument('--config', type=str, default='settings.yaml', help='配置文件路径')
+    
+    # 新增参数：随机种子和多次运行
+    parser.add_argument('--seed', type=int, default=None, 
+                        help='随机种子（用于可复现性），默认使用当前时间')
+    parser.add_argument('--num-runs', type=int, default=1,
+                        help='每个配置运行次数（论文建议 3-5 次），默认1')
+    parser.add_argument('--seeds', type=str, default=None,
+                        help='多次运行的种子列表（逗号分隔），如 "42,123,456"')
+    
+    # 新增参数：浏览器环境隔离
+    parser.add_argument('--no-incognito', action='store_true',
+                        help='禁用隐身模式（不推荐，可能导致缓存影响测试公平性）')
+    
+    # 新增参数：可视化
+    parser.add_argument('--figure-dir', type=str, default='./benchmark_figures',
+                        help='图表输出目录，默认 ./benchmark_figures')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='禁用自动生成图表')
     
     args = parser.parse_args()
     
@@ -1027,24 +1939,127 @@ def main():
         print()
         return
     
-    if args.compare:
-        profiles = [p.strip() for p in args.compare.split(',')]
-        runner.compare_profiles(profiles, args.duration, args.dry_run)
-    elif args.profile:
-        runner.run_benchmark(args.profile, args.duration, args.dry_run)
-    else:
-        parser.print_help()
-        return
+    # 解析参数
+    use_incognito = not args.no_incognito
+    seeds = None
+    if args.seeds:
+        seeds = [int(s.strip()) for s in args.seeds.split(',')]
+    elif args.seed:
+        seeds = [args.seed]
     
-    # 输出报告
-    print(runner.generate_comparison_report())
-    
-    # 输出每个配置的详细报告
-    for profile, metrics in runner.results.items():
-        print(metrics.summary())
-    
-    # 保存结果
-    runner.save_results(args.output)
+    # 运行测试
+    try:
+        if args.compare:
+            profiles = [p.strip() for p in args.compare.split(',')]
+            
+            if args.num_runs > 1:
+                # 多次运行模式（论文级）
+                logger.info(f"论文级测试模式：每个配置运行 {args.num_runs} 次")
+                runner.compare_profiles_multi_run(
+                    profiles=profiles,
+                    duration=args.duration,
+                    num_runs=args.num_runs,
+                    use_incognito=use_incognito,
+                    seeds=seeds,
+                    dry_run=args.dry_run
+                )
+                
+                # 输出聚合报告
+                print("\n" + "=" * 80)
+                print(" " * 20 + "论文级性能对比报告 (多次运行)")
+                print("=" * 80)
+                for profile, agg in runner.aggregated_results.items():
+                    print(agg.summary())
+            else:
+                # 单次运行模式
+                runner.compare_profiles(
+                    profiles=profiles,
+                    duration=args.duration,
+                    dry_run=args.dry_run,
+                    use_incognito=use_incognito,
+                    seed=seeds[0] if seeds else None
+                )
+                
+        elif args.profile:
+            if args.num_runs > 1:
+                # 多次运行模式
+                runner.run_multiple(
+                    profile=args.profile,
+                    duration=args.duration,
+                    num_runs=args.num_runs,
+                    seeds=seeds,
+                    use_incognito=use_incognito,
+                    dry_run=args.dry_run
+                )
+                
+                # 输出聚合报告
+                for profile, agg in runner.aggregated_results.items():
+                    print(agg.summary())
+            else:
+                # 单次运行
+                runner.run_benchmark(
+                    profile=args.profile,
+                    duration=args.duration,
+                    dry_run=args.dry_run,
+                    seed=seeds[0] if seeds else None,
+                    use_incognito=use_incognito
+                )
+        else:
+            parser.print_help()
+            return
+        
+        # 输出单次运行报告
+        if runner.results:
+            print(runner.generate_comparison_report())
+            for profile, metrics in runner.results.items():
+                print(metrics.summary())
+        
+        # 保存结果
+        save_data = {
+            "timestamp": datetime.now().isoformat(),
+            "settings": {
+                "duration": args.duration,
+                "num_runs": args.num_runs,
+                "use_incognito": use_incognito,
+                "seeds": seeds,
+            },
+            "single_run_results": {
+                profile: metrics.to_dict() 
+                for profile, metrics in runner.results.items()
+            },
+            "aggregated_results": {
+                profile: agg.to_dict()
+                for profile, agg in runner.aggregated_results.items()
+            } if runner.aggregated_results else {}
+        }
+        
+        with open(args.output, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"结果已保存到: {args.output}")
+        
+        # === 生成可视化图表 ===
+        if not args.no_plot:
+            try:
+                visualizer = BenchmarkVisualizer(output_dir=args.figure_dir)
+                if visualizer.available:
+                    visualizer.plot_comparison(args.output)
+                    
+                    # 如果有多次运行的聚合结果，额外生成置信区间图
+                    if runner.aggregated_results:
+                        visualizer.plot_reward_with_confidence(
+                            {p: agg.to_dict() for p, agg in runner.aggregated_results.items()}
+                        )
+                        logger.info("论文级图表生成完成（含置信区间）")
+                else:
+                    logger.warning("跳过图表生成（matplotlib 不可用）")
+            except Exception as e:
+                logger.error(f"生成图表时出错: {e}")
+                traceback.print_exc()
+        
+    finally:
+        # 清理临时目录
+        runner.cleanup_temp_dirs()
 
 
 if __name__ == "__main__":
